@@ -29,7 +29,7 @@ En `config.js` ya está configurada la misma instancia de Supabase:
 
 No reemplaces la URL ni la clave publicable si deseas trabajar con los mismos usuarios y registros. Nunca agregues una clave `sb_secret_...` o `service_role` a GitHub.
 
-Mantén también la misma URL de Apps Script en `DRIVE_API_URL` si ya tienes publicada la función para evidencias. Si aparece vacía en `config.js`, pega allí la URL que termina en `/exec`.
+`config.js` ya contiene la URL `/exec` de Apps Script. Si en el futuro vuelves a publicar la función, reemplaza únicamente ese valor por la nueva URL que termina en `/exec`.
 
 ## Pasos en el repositorio nuevo
 
