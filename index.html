@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#123f6d">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <title>Control Logístico PDV</title>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+  <link rel="preconnect" href="https://unpkg.com" crossorigin>
+  <link rel="preconnect" href="https://cdn.sheetjs.com" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <!-- La capa de cámara vive en @zxing/browser; @zxing/library no expone
+       BrowserCodeReader.listVideoInputDevices en su UMD. -->
+  <script src="https://cdn.jsdelivr.net/npm/@zxing/browser@0.2.1/umd/zxing-browser.min.js"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+  <div id="loading" class="loading hidden" aria-live="polite">
+    <div class="loading-card"><span class="spinner"></span><strong id="loadingText">Procesando…</strong></div>
+  </div>
+
+  <div id="scannerModal" class="scanner-modal hidden" role="dialog" aria-modal="true">
+    <div class="scanner-top">
+      <div><strong id="scannerTitle">Escanear código</strong><small id="scannerHint">Apunte al código de barras o QR</small></div>
+      <button type="button" class="icon-button danger" data-action="scanner-close" aria-label="Cerrar lector">×</button>
+    </div>
+    <div class="video-frame">
+      <video id="scannerVideo" autoplay muted playsinline></video>
+      <div class="scan-target"><span></span></div>
+    </div>
+    <div id="scannerStatus" class="scanner-status">Preparando cámara…</div>
+    <div class="scanner-actions">
+      <button type="button" class="button secondary" data-action="scanner-camera">Cambiar cámara</button>
+      <button type="button" class="button danger" data-action="scanner-close">Cerrar</button>
+    </div>
+  </div>
+
+  <main class="app-shell">
+    <section id="loginView" class="login-view">
+      <div class="brand brand-login">
+        <span class="brand-mark">CL</span>
+        <div><h1>Control Logístico</h1><p>Recepciones y logística inversa</p></div>
+      </div>
+      <form id="loginForm" class="card login-card">
+        <div class="card-title"><span>Acceso al sistema</span></div>
+        <label for="loginUser">Usuario</label>
+        <input id="loginUser" autocomplete="username" autocapitalize="characters" required placeholder="Ingrese su usuario">
+        <label for="loginPassword">Contraseña</label>
+        <div class="password-field">
+          <input id="loginPassword" type="password" autocomplete="current-password" required placeholder="Ingrese su contraseña">
+          <button type="button" class="eye-button" data-action="toggle-password" data-target="loginPassword" aria-label="Mostrar contraseña">Ver</button>
+        </div>
+        <button class="button primary full" type="submit">Ingresar</button>
+        <div id="loginMessage" class="form-message hidden"></div>
+      </form>
+    </section>
+
+    <section id="appView" class="hidden">
+      <header class="topbar">
+        <div class="brand compact"><span class="brand-mark">CL</span><div><strong>Control Logístico</strong><small id="profileCaption"></small></div></div>
+        <button type="button" class="icon-button" data-action="open-account-menu" aria-label="Cuenta">☰</button>
+      </header>
+
+      <nav id="mainNav" class="main-nav" aria-label="Navegación principal">
+        <button class="nav-item active" data-view="home"><span>⌂</span>Inicio</button>
+        <button class="nav-item" data-view="new"><span>＋</span>Nueva</button>
+        <button class="nav-item" data-view="records"><span>▤</span>Registros</button>
+        <button id="returnsNav" class="nav-item hidden" data-view="returns"><span>↩</span>Devoluciones</button>
+        <button id="usersNav" class="nav-item hidden" data-view="users"><span>♙</span>Usuarios</button>
+      </nav>
+
+      <div id="toastRegion" class="toast-region" aria-live="polite"></div>
+
+      <section id="homePanel" class="panel active">
+        <div class="page-heading"><div><p class="eyebrow">Panel principal</p><h2>Operaciones logísticas</h2></div><button class="button primary small" data-view="new">Nueva operación</button></div>
+        <div id="homeSummary" class="summary-grid">
+          <article class="summary-card"><span>Total hoy</span><strong id="sumToday">0</strong></article>
+          <article class="summary-card warning"><span>Pendientes</span><strong id="sumPending">0</strong></article>
+          <article class="summary-card process"><span>En proceso</span><strong id="sumProcess">0</strong></article>
+          <article class="summary-card success"><span>Completadas</span><strong id="sumDone">0</strong></article>
+        </div>
+        <div class="operation-grid">
+          <button class="operation-card truck" data-operation="RECEPCION_CAMION"><span class="operation-icon">🚚</span><strong>Recepción de camión exclusivo</strong><small>Unidad, precintos, sacos, fotos y GPS</small></button>
+          <button class="operation-card reverse" data-operation="INVERSA_CAMION"><span class="operation-icon">↩</span><strong>Logística inversa de camión</strong><small>Costales y paquetes asociados</small></button>
+          <button class="operation-card parcel" data-operation="RECEPCION_ENCOMIENDA"><span class="operation-icon">▣</span><strong>Recepción de encomiendas</strong><small>Escaneo de sacos y evidencias</small></button>
+          <button class="operation-card reverse-parcel" data-operation="INVERSA_ENCOMIENDA"><span class="operation-icon">⇆</span><strong>Logística inversa por encomienda</strong><small>Costales y paquetes devueltos</small></button>
+          <button class="operation-card warehouse" data-operation="RECOJO_ALMACEN"><span class="operation-icon">⌂</span><strong>Recojo en almacén</strong><small>Escaneo de sacos y evidencias, sin guía de remisión</small></button>
+          <button class="operation-card warehouse-reverse" data-operation="INVERSA_RECOJO_ALMACEN"><span class="operation-icon">↪</span><strong>Logística inversa de recojo</strong><small>Costales y paquetes devueltos, sin guía de remisión</small></button>
+        </div>
+        <section class="card">
+          <div class="card-title"><span>Actividad reciente</span><button class="link-button" data-view="records">Ver todos</button></div>
+          <div id="recentList" class="record-list"><div class="empty-state">No hay registros para mostrar.</div></div>
+        </section>
+      </section>
+
+      <section id="newPanel" class="panel">
+        <div class="page-heading"><div><p class="eyebrow">Nuevo registro</p><h2 id="newPanelTitle">Selecciona una operación</h2></div></div>
+        <div id="operationPicker" class="operation-grid compact-grid">
+          <button class="operation-card truck" data-operation="RECEPCION_CAMION"><span class="operation-icon">🚚</span><strong>Recepción camión</strong></button>
+          <button class="operation-card reverse" data-operation="INVERSA_CAMION"><span class="operation-icon">↩</span><strong>Inversa camión</strong></button>
+          <button class="operation-card parcel" data-operation="RECEPCION_ENCOMIENDA"><span class="operation-icon">▣</span><strong>Recepción encomienda</strong></button>
+          <button class="operation-card reverse-parcel" data-operation="INVERSA_ENCOMIENDA"><span class="operation-icon">⇆</span><strong>Inversa encomienda</strong></button>
+          <button class="operation-card warehouse" data-operation="RECOJO_ALMACEN"><span class="operation-icon">⌂</span><strong>Recojo almacén</strong></button>
+          <button class="operation-card warehouse-reverse" data-operation="INVERSA_RECOJO_ALMACEN"><span class="operation-icon">↪</span><strong>Inversa recojo almacén</strong></button>
+        </div>
+
+        <form id="operationSetup" class="card hidden">
+          <div class="card-title"><span id="setupTitle">Datos de la operación</span><button type="button" class="link-button danger-text" data-action="cancel-operation">Cancelar</button></div>
+          <div class="field"><label for="operationOt">OT / ID de gestión</label><div class="scan-input"><input id="operationOt" required autocapitalize="characters" placeholder="Ingrese o escanee la OT"><button type="button" data-scan-target="operationOt" data-scan-label="OT">▣</button></div></div>
+          <div id="pdvField" class="field hidden"><label for="operationPdv">PDV</label><select id="operationPdv"></select></div>
+          <div id="truckFields" class="field-grid hidden">
+            <div class="field"><label for="routeId">ID de ruta <span class="optional">(opcional)</span></label><div class="scan-input"><input id="routeId" autocapitalize="characters"><button type="button" data-scan-target="routeId" data-scan-label="ID de ruta">▣</button></div></div>
+            <div class="field"><label for="vehiclePlate">Placa</label><input id="vehiclePlate" autocapitalize="characters" placeholder="ABC123"></div>
+          </div>
+          <div id="parcelFields" class="field-grid hidden">
+            <div class="field"><label for="parcelCompany">Empresa de encomienda <span class="optional">(opcional)</span></label><input id="parcelCompany" placeholder="Empresa transportista"></div>
+            <div class="field"><label for="parcelNumber">Número de encomienda o guía <span class="optional">(opcional)</span></label><div class="scan-input"><input id="parcelNumber" autocapitalize="characters"><button type="button" data-scan-target="parcelNumber" data-scan-label="Número de encomienda">▣</button></div></div>
+          </div>
+          <button type="submit" class="button primary full">Iniciar operación</button>
+        </form>
+
+        <section id="operationWorkspace" class="hidden">
+          <div class="operation-banner"><div><small>OPERACIÓN EN CURSO</small><strong id="activeOperationCode"></strong><span id="activeOperationLabel"></span></div><span id="activeOperationStatus" class="status-pill draft">Pendiente</span></div>
+
+          <section id="transportGuideSection" class="card flow-section">
+            <div class="step-title"><span>1</span><div><strong>Guía de remisión transporte</strong><small>Adjunte el documento; puede reemplazarlo o eliminarlo hasta completar la operación.</small></div></div>
+            <label for="transportGuideNumber">N.° de guía de remisión <span class="optional">(opcional)</span></label>
+            <input id="transportGuideNumber" autocapitalize="characters" placeholder="Ejemplo: T001-00012345">
+            <label for="transportGuideInput">Archivo de guía de remisión *</label>
+            <input id="transportGuideInput" type="file" accept="image/*,.pdf,application/pdf">
+            <div id="transportGuidePreview" class="document-preview">Sin documento adjunto.</div>
+            <button id="removeTransportGuideButton" type="button" class="link-button danger-text hidden" data-action="remove-transport-guide">Eliminar guía adjunta</button>
+          </section>
+
+          <section id="truckArrivalSection" class="card flow-section hidden">
+            <div class="step-title"><span>2</span><div><strong>Llegada de la unidad</strong><small>Fotografías y precintos de llegada</small></div></div>
+            <div class="photo-grid">
+              <div class="photo-slot" data-photo-slot="LLEGADA_UNIDAD" data-photo-label="Llegada de la unidad"><strong>Llegada de la unidad *</strong><input type="file" accept="image/*"><div class="photo-preview">Sin fotografía</div></div>
+              <div class="photo-slot" data-photo-slot="INTERIOR_UNIDAD" data-photo-label="Interior de la unidad"><strong>Interior de la unidad</strong><input type="file" accept="image/*"><div class="photo-preview">Sin fotografía</div></div>
+            </div>
+            <h3 class="section-subtitle">Precintos de llegada</h3>
+            <div id="arrivalSeals" class="seal-grid"></div>
+          </section>
+
+          <section id="receiptItemsSection" class="card flow-section hidden">
+            <div class="step-title"><span id="receiptStepNumber">2</span><div><strong id="receiptItemsTitle">Sacos y bultos recibidos</strong><small>Escanee cada código una sola vez</small></div></div>
+            <div id="itemTypeChooser" class="segment-control"><button type="button" class="active" data-item-type="SACO">Saco</button><button type="button" data-item-type="BULTO_SUELTO">Bulto suelto</button></div>
+            <button type="button" class="button scan full" data-scan-mode="RECEIPT_ITEM">Abrir lector continuo</button>
+            <div class="manual-row"><input id="manualReceiptCode" autocapitalize="characters" placeholder="Código del saco o bulto"><button type="button" class="button secondary" data-action="add-receipt-manual">Agregar</button></div>
+            <div class="counter-row"><span>Escaneados</span><strong id="receiptItemCount">0</strong></div>
+            <div id="receiptItemsList" class="scan-list"></div>
+            <div id="loadPhotoSlot" class="photo-slot single" data-photo-slot="CARGA_RECIBIDA" data-photo-label="Sacos y bultos recibidos"><strong>Foto de sacos/bultos recibidos *</strong><input type="file" accept="image/*"><div class="photo-preview">Sin fotografía</div></div>
+          </section>
+
+          <section id="inverseSection" class="card flow-section hidden">
+            <div class="step-title"><span>2</span><div><strong>Costales y paquetes devueltos</strong><small>Abra un costal y asigne sus guías o paquetes</small></div></div>
+            <div id="activeSackBox" class="active-sack empty"><span>Costal activo</span><strong id="activeSackCode">Ninguno</strong><small id="activeSackCount">Escanee un costal para comenzar</small></div>
+            <div class="two-actions">
+              <button type="button" class="button scan" data-scan-mode="SACK">Escanear costal</button>
+              <button type="button" id="closeSackButton" class="button secondary" data-action="close-sack" disabled>Cerrar costal</button>
+            </div>
+            <div class="manual-row"><input id="manualSackCode" autocapitalize="characters" placeholder="Código del costal"><button type="button" class="button secondary" data-action="add-sack-manual">Abrir</button></div>
+            <div class="divider"></div>
+            <button type="button" id="packageScannerButton" class="button scan full" data-scan-mode="PACKAGE" disabled>Escanear paquetes del costal</button>
+            <div class="manual-row"><input id="manualPackageCode" autocapitalize="characters" placeholder="Código del paquete (JPE…)"><button type="button" class="button secondary" data-action="add-package-manual">Agregar</button></div>
+            <small class="field-hint">Los códigos de paquetes deben comenzar con <strong>JPE</strong>.</small>
+            <div class="counter-row"><span>Costales / paquetes</span><strong><span id="sackCount">0</span> / <span id="packageCount">0</span></strong></div>
+            <div id="sackList" class="sack-list"></div>
+            <div id="inversePhotos" class="general-photos" data-category="LOGISTICA_INVERSA">
+              <div class="section-subtitle">Evidencias de la entrega *</div>
+              <input id="inversePhotoInput" type="file" accept="image/*" multiple>
+              <small>Puede seleccionar o tomar hasta 3 fotografías.</small>
+              <div id="inversePhotoPreview" class="photo-grid"></div>
+            </div>
+          </section>
+
+          <section id="emptySacksSection" class="card flow-section hidden">
+            <div class="step-title"><span>+</span><div><strong>Sacos vacíos retornados</strong><small>Registre los sacos con código y los que no tienen código.</small></div></div>
+            <div id="emptySackTypeChooser" class="segment-control">
+              <button type="button" class="active" data-empty-sack-type="CON_CODIGO">Con código</button>
+              <button type="button" data-empty-sack-type="SIN_CODIGO">Sin código</button>
+            </div>
+            <div id="emptySackCodePanel">
+              <button type="button" class="button scan full" data-scan-mode="EMPTY_SACK">Abrir lector para saco vacío</button>
+              <div class="manual-row"><input id="manualEmptySackCode" autocapitalize="characters" placeholder="Código de saco vacío"><button type="button" class="button secondary" data-action="add-empty-sack-manual">Agregar</button></div>
+            </div>
+            <div id="emptySackNoCodePanel" class="hidden">
+              <div class="field-grid">
+                <div class="field"><label for="manualEmptySackQuantity">Cantidad</label><input id="manualEmptySackQuantity" type="number" min="1" step="1" value="1" inputmode="numeric"></div>
+                <div class="field"><label for="manualEmptySackObservation">Observación <span class="optional">(opcional)</span></label><input id="manualEmptySackObservation" placeholder="Ej. saco roto o sin etiqueta"></div>
+              </div>
+              <button type="button" class="button secondary full" data-action="add-empty-sack-no-code">Registrar sacos sin código</button>
+            </div>
+            <div class="counter-row"><span>Total retornados</span><strong id="emptySackTotalCount">0</strong></div>
+            <div class="counter-row"><span>Con código / sin código</span><strong><span id="emptySackCodeCount">0</span> / <span id="emptySackNoCodeCount">0</span></strong></div>
+            <div id="emptySackList" class="scan-list"></div>
+            <div id="emptySackPhotos" class="general-photos" data-category="SACOS_VACIOS">
+              <div class="section-subtitle">Evidencias de sacos vacíos <span class="required-mark">*</span></div>
+              <input id="emptySackPhotoInput" type="file" accept="image/*" multiple>
+              <small>Adjunte hasta 3 fotografías de los sacos retornados.</small>
+              <div id="emptySackPhotoPreview" class="photo-grid"></div>
+            </div>
+          </section>
+
+          <section id="truckDepartureSection" class="card flow-section hidden">
+            <div class="step-title"><span>3</span><div><strong>Salida de la unidad</strong><small>Precintos de salida</small></div></div>
+            <div id="departureSeals" class="seal-grid"></div>
+          </section>
+
+          <section id="parcelPhotosSection" class="card flow-section hidden">
+            <div class="step-title"><span>2</span><div><strong>Evidencias de recepción</strong><small>Hasta tres fotografías</small></div></div>
+            <input id="parcelPhotoInput" type="file" accept="image/*" multiple>
+            <small>En iPhone puede tomar una fotografía o elegirla de la galería.</small>
+            <div id="parcelPhotoPreview" class="photo-grid"></div>
+          </section>
+
+          <section class="card flow-section">
+            <div class="step-title"><span>✓</span><div><strong>Confirmación</strong><small>Ubicación, responsable y observaciones</small></div></div>
+            <div id="gpsStatus" class="gps-box">Ubicación pendiente.</div>
+            <button type="button" class="button secondary full" data-action="get-gps">Obtener ubicación GPS</button>
+            <div class="field"><label for="responsibleDocument">DNI/RUC del responsable <span class="optional">(opcional)</span></label><input id="responsibleDocument" inputmode="numeric" maxlength="11"></div>
+            <div class="field"><label for="operationNotes">Observaciones <span class="optional">(opcional)</span></label><textarea id="operationNotes" rows="3"></textarea></div>
+            <button id="deleteActiveOperationButton" type="button" class="button danger full hidden" data-action="delete-active-operation">Eliminar borrador</button>
+            <button id="finishOperationButton" type="button" class="button success full" data-action="finish-operation">Confirmar descarga y completar</button>
+          </section>
+        </section>
+      </section>
+
+      <section id="recordsPanel" class="panel">
+        <div class="page-heading"><div><p class="eyebrow">Consulta</p><h2>Registros</h2></div><button class="button secondary small" data-action="refresh-records">Actualizar</button></div>
+        <section class="card filters-card">
+          <div class="filter-grid">
+            <div><label for="filterType">Operación</label><select id="filterType"><option value="">Todas</option><option value="RECEPCION_CAMION">Recepción camión</option><option value="INVERSA_CAMION">Inversa camión</option><option value="RECEPCION_ENCOMIENDA">Recepción encomienda</option><option value="INVERSA_ENCOMIENDA">Inversa encomienda</option><option value="RECOJO_ALMACEN">Recojo en almacén</option><option value="INVERSA_RECOJO_ALMACEN">Inversa recojo almacén</option></select></div>
+            <div><label for="filterStatus">Estado</label><select id="filterStatus"><option value="">Todos</option><option value="PENDIENTE">Pendiente</option><option value="EN_PROCESO">En proceso</option><option value="COMPLETADO">Completado</option><option value="ANULADO">Anulado</option></select></div>
+            <div><label for="filterFrom">Desde</label><input id="filterFrom" type="date"></div>
+            <div><label for="filterTo">Hasta</label><input id="filterTo" type="date"></div>
+          </div>
+          <button type="button" class="button primary full" data-action="search-records">Buscar</button>
+        </section>
+        <div id="recordsSummary" class="summary-grid three"></div>
+        <div id="recordsList" class="record-list"><div class="empty-state">Utilice los filtros para consultar.</div></div>
+      </section>
+
+      <section id="returnsPanel" class="panel">
+        <div class="page-heading">
+          <div><p class="eyebrow">Administrador y Encargado</p><h2>Recepción de devoluciones</h2></div>
+          <button type="button" class="button secondary small" data-action="new-devolucion">Nueva recepción</button>
+        </div>
+        <form id="devolucionForm" class="card">
+          <div class="card-title"><span>Registrar devolución recibida</span><span class="status-pill done">Independiente</span></div>
+          <p class="helper-text">Escanee la OT de la logística inversa y registre lo recibido físicamente. La OT quedará marcada como recepcionada en los módulos de logística inversa.</p>
+          <div class="field">
+            <label for="devolucionOt">OT de devolución</label>
+            <div class="scan-input"><input id="devolucionOt" required autocapitalize="characters" placeholder="Ingrese o escanee la OT"><button type="button" data-scan-target="devolucionOt" data-scan-label="OT de devolución">▣</button></div>
+          </div>
+          <button type="button" class="button secondary full" data-action="load-devolucion-ot">Consultar OT</button>
+          <div id="devolucionOtStatus" class="form-message hidden"></div>
+          <div class="field"><label for="devolucionFecha">Fecha y hora de ejecución</label><input id="devolucionFecha" type="datetime-local" required></div>
+
+          <div class="return-grid">
+            <div class="return-row"><strong>Paquetes con código</strong><input id="devolucionPaquetesConCodigo" type="number" min="0" step="1" value="0" inputmode="numeric" aria-label="Cantidad de paquetes con código"><input id="devolucionObsPaquetesConCodigo" placeholder="Observación (opcional)" aria-label="Observación de paquetes con código"></div>
+            <div class="return-row"><strong>Paquetes sin código</strong><input id="devolucionPaquetesSinCodigo" type="number" min="0" step="1" value="0" inputmode="numeric" aria-label="Cantidad de paquetes sin código"><input id="devolucionObsPaquetesSinCodigo" placeholder="Observación (opcional)" aria-label="Observación de paquetes sin código"></div>
+            <div class="return-row"><strong>Costales con código</strong><input id="devolucionCostalesConCodigo" type="number" min="0" step="1" value="0" inputmode="numeric" aria-label="Cantidad de costales con código"><input id="devolucionObsCostalesConCodigo" placeholder="Observación (opcional)" aria-label="Observación de costales con código"></div>
+            <div class="return-row"><strong>Costales sin código</strong><input id="devolucionCostalesSinCodigo" type="number" min="0" step="1" value="0" inputmode="numeric" aria-label="Cantidad de costales sin código"><input id="devolucionObsCostalesSinCodigo" placeholder="Observación (opcional)" aria-label="Observación de costales sin código"></div>
+          </div>
+          <div class="field"><label for="devolucionObservaciones">Observaciones generales <span class="optional">(opcional)</span></label><textarea id="devolucionObservaciones" rows="3" placeholder="Incidencias, diferencias o comentarios de la recepción"></textarea></div>
+          <div id="devolucionPhotoSlot" class="photo-slot single"><strong>Foto de la recepción *</strong><input id="devolucionPhotoInput" type="file" accept="image/*"><div id="devolucionPhotoPreview" class="photo-preview">Sin fotografía</div></div>
+          <button type="submit" class="button success full">Guardar recepción</button>
+        </form>
+        <section class="card">
+          <div class="card-title"><span>Recepciones recientes</span><button type="button" class="link-button" data-action="refresh-devoluciones">Actualizar</button></div>
+          <div id="devolucionesList" class="record-list"><div class="empty-state">No hay recepciones registradas.</div></div>
+        </section>
+      </section>
+
+      <section id="usersPanel" class="panel">
+        <div class="page-heading"><div><p class="eyebrow">Administración</p><h2>PDV y usuarios</h2></div></div>
+        <div class="two-column">
+          <form id="pdvForm" class="card">
+            <div class="card-title"><span>Crear PDV</span></div>
+            <label for="pdvCode">Código</label><input id="pdvCode" required autocapitalize="characters">
+            <label for="pdvName">Nombre del PDV</label><input id="pdvName" required>
+            <label for="pdvRegion">Región</label><input id="pdvRegion">
+            <label for="pdvArea">Área</label><input id="pdvArea">
+            <div id="managerPdvField" class="field hidden"><label for="pdvManager">Encargado</label><select id="pdvManager"></select></div>
+            <button class="button primary full" type="submit">Crear PDV</button>
+          </form>
+          <form id="userForm" class="card">
+            <div class="card-title"><span>Crear cuenta</span></div>
+            <label for="newUsername">Usuario</label><input id="newUsername" required autocapitalize="characters">
+            <label for="newFullName">Nombres y apellidos</label><input id="newFullName" required>
+            <label for="newRole">Rol</label><select id="newRole"><option value="PDV">PDV</option><option value="ENCARGADO">Encargado</option><option value="ADMINISTRADOR">Administrador</option></select>
+            <div id="newUserPdvField"><label for="newUserPdv">PDV correspondiente</label><select id="newUserPdv"></select></div>
+            <label for="newPassword">Contraseña temporal</label><div class="password-field"><input id="newPassword" type="password" minlength="8" required><button type="button" class="eye-button" data-action="toggle-password" data-target="newPassword">Ver</button></div>
+            <button class="button primary full" type="submit">Crear cuenta</button>
+          </form>
+        </div>
+        <section id="bulkPdvCard" class="card hidden">
+          <div class="card-title">
+            <span>Carga masiva de PDV</span>
+            <button type="button" class="link-button" data-action="download-pdv-template">Descargar plantilla</button>
+          </div>
+          <p class="helper-text">Disponible solo para Administradores. Crea o actualiza cada PDV y su cuenta de acceso con el usuario y contraseña temporal definidos en el archivo. Los encargados indicados deben existir previamente.</p>
+          <label for="bulkPdvFile">Archivo Excel o CSV</label>
+          <input id="bulkPdvFile" type="file" accept=".xlsx,.xls,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel">
+          <div id="bulkPdvFileInfo" class="file-info">Seleccione la plantilla completada para validar los registros.</div>
+          <div id="bulkPdvSummary" class="bulk-summary hidden"></div>
+          <div id="bulkPdvPreview" class="table-wrap hidden"></div>
+          <div class="bulk-actions">
+            <button id="bulkPdvImportButton" type="button" class="button primary" data-action="import-pdvs" disabled>Importar registros válidos</button>
+            <button id="bulkPdvResultButton" type="button" class="button secondary hidden" data-action="download-pdv-result">Descargar resultado</button>
+          </div>
+          <div id="bulkPdvMessage" class="form-message hidden"></div>
+        </section>
+        <section class="card"><div class="card-title"><span>Cuentas visibles</span><button class="link-button" data-action="refresh-users">Actualizar</button></div><div id="usersList" class="record-list"></div></section>
+      </section>
+    </section>
+  </main>
+
+  <dialog id="accountDialog" class="modal-card">
+    <div class="modal-head"><strong>Mi cuenta</strong><button type="button" class="icon-button" data-action="close-dialog" data-dialog="accountDialog">×</button></div>
+    <div id="accountInfo" class="account-info"></div>
+    <button type="button" class="button secondary full" data-action="open-password-dialog">Cambiar mi contraseña</button>
+    <button type="button" class="button danger full" data-action="logout">Cerrar sesión</button>
+  </dialog>
+
+  <dialog id="passwordDialog" class="modal-card">
+    <form id="passwordForm">
+      <div class="modal-head"><strong>Cambiar contraseña</strong><button type="button" class="icon-button" data-action="close-dialog" data-dialog="passwordDialog">×</button></div>
+      <label for="passwordNew">Nueva contraseña</label><input id="passwordNew" type="password" minlength="8" required>
+      <label for="passwordConfirm">Confirmar contraseña</label><input id="passwordConfirm" type="password" minlength="8" required>
+      <button type="submit" class="button primary full">Guardar contraseña</button>
+    </form>
+  </dialog>
+
+  <dialog id="recordDialog" class="modal-card wide"><div class="modal-head"><strong id="recordDialogTitle">Detalle</strong><button type="button" class="icon-button" data-action="close-dialog" data-dialog="recordDialog">×</button></div><div id="recordDetail"></div></dialog>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,142 @@
+# Control Logístico PDV
+
+Aplicación móvil para GitHub Pages con Supabase como base de datos y autenticación, y Google Drive como repositorio privado de evidencias.
+
+## Operaciones incluidas
+
+1. Recepción de camión exclusivo: llegada, precintos, sacos/bultos, fotografías, GPS y precintos de salida.
+2. Logística inversa de camión exclusivo: costales identificados por código de barras y paquetes asociados a cada costal.
+3. Recepción de encomiendas: escaneo de sacos, fotografías y GPS.
+4. Logística inversa por encomienda: costales identificados por código de barras y paquetes asociados a cada costal.
+5. Recepción de devoluciones: módulo independiente para Administrador y Encargado. Se consulta la OT de una logística inversa, se registra fecha/hora, cantidades de paquetes y costales con/sin código, observaciones y una fotografía.
+6. Recojo en almacén: escaneo de sacos, fotografías, GPS y observaciones, sin guía de remisión.
+7. Logística inversa de recojo en almacén: costales y paquetes devueltos, fotografías, GPS y control de sacos vacíos, sin guía de remisión.
+
+En recepción de camión exclusivo, logística inversa de camión y logística inversa por encomienda también se controlan los **sacos vacíos retornados**. Los sacos con código se escanean (o se ingresan manualmente) sin permitir duplicados; los sacos sin código se registran por cantidad y observación. Cuando se registra al menos uno, la operación exige hasta tres fotografías de evidencia, guardadas en Drive.
+
+Los códigos de paquetes se validan con el prefijo **JPE** tanto en la aplicación como en Supabase. Si el Administrador necesita corregir una OT, guía, saco, costal, paquete, saco vacío o precinto, puede abrir el detalle del registro y utilizar **Editar información registrada**. En las logísticas inversas también puede pulsar **Agregar costal** para completar los costales omitidos; el código es opcional y un campo vacío se registra como **sin código**. Las correcciones y altas se guardan en `auditoria_cambios` y se muestran en el campo **Resumen de cambios administrativos** con fecha, usuario, campo, valor anterior y valor nuevo.
+
+Los paquetes no se guardan como texto dentro del costal. Cada uno mantiene una relación individual `operación → costal → paquete`, lo que permite buscarlo y auditarlo.
+
+## Flujo de OT y estados
+
+Cada recepción y cada logística inversa se crea con una **OT obligatoria**. La OT se utiliza como el ID visible de la gestión. La guía de remisión transporte se puede adjuntar como imagen o PDF y aparece debajo de la OT en los registros. Al seleccionar el archivo se guarda de inmediato en Drive; mientras la operación no esté completada se puede reemplazar o eliminar.
+
+Las operaciones **Recojo en almacén** y **Logística inversa de recojo en almacén** no solicitan guía de remisión. El recojo utiliza el flujo de escaneo y evidencias de encomiendas; su logística inversa utiliza el flujo de costales y paquetes devueltos.
+
+- `PENDIENTE`: la gestión acaba de crearse.
+- `EN_PROCESO`: ya contiene guías, costales, paquetes, precintos o evidencias.
+- `COMPLETADO`: se confirmó la descarga; desde ese momento ya no se permite modificar ni eliminar guías.
+
+La recepción de devoluciones tiene su propio registro y estado. Al guardar una recepción, la logística inversa vinculada por OT muestra `Recepción devolución: Recepcionado`; mientras no exista el registro muestra `Pendiente`. El Administrador puede ver todas las devoluciones y el Encargado puede ejecutar y consultar únicamente las de sus PDV asignados.
+
+Mientras la operación esté pendiente o en proceso se pueden escanear y eliminar guías, costales y paquetes. Para completar una operación se exige la guía de remisión, las evidencias correspondientes y la confirmación de descarga.
+
+Solo el usuario ADMINISTRADOR puede eliminar una operación completa mientras esté Pendiente o En proceso. Esta acción elimina también sus escaneos, costales, paquetes y evidencias asociadas de Drive. Las operaciones Completadas quedan protegidas.
+
+## Archivos
+
+- `index.html`, `styles.css`, `app.js`: interfaz GitHub Pages.
+- `config.js`: URL y clave publicable de Supabase y endpoint de Apps Script.
+- `supabase/schema.sql`: tablas, índices, validaciones y políticas RLS.
+- `supabase/functions/crear-usuario/index.ts`: creación segura de PDV y cuentas.
+- `apps-script/Code.gs`: subida y lectura autorizada de fotografías privadas en Drive.
+
+## 1. Configurar Supabase
+
+1. Abrir el proyecto de Supabase.
+2. Ir a **SQL Editor**.
+3. Crear una consulta nueva, pegar todo `supabase/schema.sql` y ejecutarla.
+4. Ir a **Authentication → Providers → Email** y desactivar el registro público de usuarios. Las cuentas se crearán desde el panel administrativo de la aplicación.
+
+Si el proyecto ya tenía la versión anterior, vuelve a ejecutar el `schema.sql` actualizado: migra `BORRADOR/FINALIZADO` a `PENDIENTE/EN_PROCESO/COMPLETADO`, agrega la OT, el número de guía de remisión, los tipos `RECOJO_ALMACEN` e `INVERSA_RECOJO_ALMACEN`, el estado automático, la categoría de documento en evidencias, la tabla `sacos_vacios`, la tabla `auditoria_cambios`, las tablas `recepciones_devoluciones` y `evidencias_recepciones_devoluciones`, el estado `estado_recepcion_devolucion`, sus políticas RLS y la validación de paquetes `JPE`.
+
+### Crear el primer administrador
+
+1. Ir a **Authentication → Users → Add user**.
+2. Crear el usuario con el correo interno `admin@control-logistico.local`, una contraseña segura y la opción de confirmar automáticamente el correo.
+3. Copiar el UUID del usuario recién creado.
+4. Ejecutar en SQL Editor, reemplazando `UUID_DEL_USUARIO`:
+
+```sql
+insert into public.perfiles (id, usuario, nombre, rol, estado)
+values (
+  'UUID_DEL_USUARIO',
+  'ADMIN',
+  'ADMINISTRADOR PRINCIPAL',
+  'ADMINISTRADOR',
+  'ACTIVO'
+);
+```
+
+Después podrá ingresar en la web con usuario `ADMIN` y la contraseña elegida.
+
+### Publicar la función de administración
+
+La función `crear-usuario` mantiene las claves de servidor dentro de Supabase; ninguna clave secreta llega a GitHub o al navegador.
+
+Con Supabase CLI:
+
+```bash
+supabase login
+supabase link --project-ref qtgcpmpbtfhvoasncmkg
+supabase functions deploy crear-usuario
+```
+
+También se puede crear la función desde el panel de Supabase copiando `supabase/functions/crear-usuario/index.ts`.
+
+### Carga masiva de PDV
+
+El Administrador puede descargar una plantilla Excel desde **Usuarios → Carga masiva de PDV**. La hoja admite hasta 1,000 registros y utiliza las columnas:
+
+- `CODIGO_PDV`
+- `NOMBRE_PDV`
+- `REGION`
+- `AREA`
+- `USUARIO_ENCARGADO`
+- `USUARIO_PDV`
+- `CONTRASENA_TEMPORAL`
+- `ESTADO`
+
+Los encargados deben existir previamente y estar activos. El Administrador define en el archivo el usuario y la contraseña de cada PDV; la contraseña debe tener entre 8 y 72 caracteres. Antes de importar se muestra una vista previa que oculta las contraseñas. Los códigos nuevos se crean y los códigos existentes se actualizan. Si ya existe una cuenta PDV asociada al mismo PDV y con el mismo usuario, se actualiza su contraseña; si el PDV ya tiene otro usuario, o la cuenta está relacionada con otro PDV u otro rol, la fila se rechaza. El procesamiento se realiza en lotes de 25 registros mediante la función Edge `crear-usuario`.
+
+La descarga del resultado incluye la contraseña indicada para facilitar la entrega de credenciales. Proteja ese archivo y elimínelo cuando ya no sea necesario; no use la contraseña del ejemplo de la plantilla en producción. Si el PDV se guarda pero falla la cuenta, el resultado queda marcado como `PARCIAL` para corregirlo sin perder el registro del PDV.
+
+## 2. Configurar Google Drive
+
+1. Crear una carpeta exclusiva para evidencias.
+2. Copiar el identificador de la carpeta desde su URL.
+3. Crear un proyecto nuevo de Google Apps Script.
+4. Reemplazar el contenido por `apps-script/Code.gs` (incluye subida de imágenes/PDF y eliminación autorizada de la guía antes de completar).
+5. Sustituir `REEMPLAZAR_CON_ID_DE_CARPETA` por el identificador real.
+6. Implementar como **Aplicación web**:
+   - Ejecutar como: propietario.
+   - Quién tiene acceso: cualquier usuario con el enlace.
+7. Copiar la URL terminada en `/exec` y colocarla en `config.js`:
+
+```js
+DRIVE_API_URL: "URL_DE_APPS_SCRIPT/exec",
+```
+
+Aunque la aplicación web de Apps Script acepte solicitudes, cada acción valida la sesión de Supabase. Los archivos de Drive no se comparten públicamente; las evidencias se cargan bajo demanda después de comprobar las políticas RLS.
+
+Después de actualizar `apps-script/Code.gs`, vuelve a crear una versión de la implementación web y conserva la misma URL `/exec` en `config.js`. El puente también valida y permite leer/eliminar la foto de `evidencias_recepciones_devoluciones`.
+
+## 3. Probar y publicar
+
+1. Abrir la aplicación desde GitHub Pages usando HTTPS. La cámara y el GPS no funcionarán correctamente en HTTP.
+2. Ingresar con el primer administrador.
+3. Crear un Encargado.
+4. Crear un PDV asignándolo al Encargado.
+5. Crear la cuenta PDV.
+6. Probar una operación de cada tipo desde un iPhone.
+7. Ingresar como Administrador o Encargado, abrir **Devoluciones**, consultar una OT inversa, adjuntar la foto y guardar la recepción.
+8. Probar **Recojo en almacén** y **Logística inversa de recojo en almacén**; confirmar que no solicitan guía de remisión.
+9. Confirmar que Administrador, Encargado y PDV solo consultan los registros permitidos.
+
+## Seguridad
+
+- Solo `SUPABASE_PUBLISHABLE_KEY` puede estar en el frontend.
+- No guardar nunca `sb_secret_...` ni `service_role` en GitHub, Apps Script, HTML o mensajes.
+- Las políticas RLS determinan el acceso real; ocultar botones no se considera una medida de seguridad.
+- Las evidencias permanecen privadas en Drive y se solicitan con una sesión válida.

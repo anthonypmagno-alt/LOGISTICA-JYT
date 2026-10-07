@@ -1,0 +1,2431 @@
+(() => {
+  "use strict";
+
+  const CFG = window.APP_CONFIG || {};
+  const TYPE_LABELS = {
+    RECEPCION_CAMION: "Recepción de camión exclusivo",
+    INVERSA_CAMION: "Logística inversa de camión exclusivo",
+    RECEPCION_ENCOMIENDA: "Recepción de encomiendas",
+    INVERSA_ENCOMIENDA: "Logística inversa por encomienda",
+    RECOJO_ALMACEN: "Recojo en almacén",
+    INVERSA_RECOJO_ALMACEN: "Logística inversa de recojo en almacén",
+  };
+  const TYPE_PREFIX = {
+    RECEPCION_CAMION: "RC",
+    INVERSA_CAMION: "IC",
+    RECEPCION_ENCOMIENDA: "RE",
+    INVERSA_ENCOMIENDA: "IE",
+    RECOJO_ALMACEN: "RA",
+    INVERSA_RECOJO_ALMACEN: "IRA",
+  };
+  const STATUS_LABELS = {
+    PENDIENTE: "Pendiente",
+    EN_PROCESO: "En proceso",
+    COMPLETADO: "Completado",
+    ANULADO: "Anulado",
+    BORRADOR: "Pendiente",
+    FINALIZADO: "Completado",
+  };
+  const RECEIPT_TYPES = new Set(["RECEPCION_CAMION", "RECEPCION_ENCOMIENDA", "RECOJO_ALMACEN"]);
+  const INVERSE_TYPES = new Set(["INVERSA_CAMION", "INVERSA_ENCOMIENDA", "INVERSA_RECOJO_ALMACEN"]);
+  const EMPTY_SACK_TYPES = new Set(["RECEPCION_CAMION", "INVERSA_CAMION", "INVERSA_ENCOMIENDA", "INVERSA_RECOJO_ALMACEN"]);
+  const NO_TRANSPORT_GUIDE_TYPES = new Set(["RECOJO_ALMACEN", "INVERSA_RECOJO_ALMACEN"]);
+  const BULK_PDV_HEADERS = ["CODIGO_PDV", "NOMBRE_PDV", "REGION", "AREA", "USUARIO_ENCARGADO", "USUARIO_PDV", "CONTRASENA_TEMPORAL", "ESTADO"];
+  const BULK_PDV_MAX_ROWS = 1000;
+  const BULK_PDV_BATCH_SIZE = 25;
+  const BULK_PDV_MAX_FILE_BYTES = 5 * 1024 * 1024;
+
+  if (!CFG.SUPABASE_URL || !CFG.SUPABASE_PUBLISHABLE_KEY || !window.supabase) {
+    document.body.innerHTML = '<div class="empty-state" style="margin:30px">Falta configurar Supabase en config.js.</div>';
+    return;
+  }
+
+  const db = window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_PUBLISHABLE_KEY, {
+    auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+  });
+
+  const state = {
+    session: null,
+    profile: null,
+    pdvs: [],
+    users: [],
+    bulkPdvRows: [],
+    bulkPdvResults: [],
+    selectedType: "",
+    operation: null,
+    items: [],
+    sacks: [],
+    packages: [],
+    seals: [],
+    evidences: [],
+    emptySacks: [],
+    transportGuide: null,
+    receiptItemType: "SACO",
+    activeSack: null,
+    photoDrafts: new Map(),
+    inversePhotos: [],
+    parcelPhotos: [],
+    emptySackPhotos: [],
+    gps: null,
+    devolucion: {
+      inverseOperation: null,
+      reception: null,
+      evidence: null,
+      photoDraft: null,
+    },
+    scanner: {
+      reader: null,
+      devices: [],
+      deviceIndex: 0,
+      mode: "",
+      inputId: "",
+      active: false,
+      locked: false,
+      lastCode: "",
+      lastAt: 0,
+    },
+  };
+
+  const $ = (selector, root = document) => root.querySelector(selector);
+  const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
+  const normalizeCode = (value) => String(value ?? "").trim().toUpperCase();
+  const escapeHtml = (value) => String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+  const isReceipt = () => RECEIPT_TYPES.has(state.operation?.tipo || state.selectedType);
+  const isInverse = () => INVERSE_TYPES.has(state.operation?.tipo || state.selectedType);
+  const hasEmptySackControl = () => EMPTY_SACK_TYPES.has(state.operation?.tipo || state.selectedType);
+  const requiresTransportGuide = () => !NO_TRANSPORT_GUIDE_TYPES.has(state.operation?.tipo || state.selectedType);
+  const isTruckReceipt = () => (state.operation?.tipo || state.selectedType) === "RECEPCION_CAMION";
+  const statusLabel = (status) => STATUS_LABELS[status] || status || "Pendiente";
+  const statusClass = (status) => status === "COMPLETADO" || status === "FINALIZADO" ? "done" : status === "EN_PROCESO" ? "process" : status === "ANULADO" ? "cancelled" : "draft";
+  const todayInput = () => {
+    const date = new Date();
+    const offset = date.getTimezoneOffset();
+    return new Date(date.getTime() - offset * 60000).toISOString().slice(0, 10);
+  };
+  const localDateTimeValue = (value) => {
+    const date = value ? new Date(value) : new Date();
+    if (Number.isNaN(date.getTime())) return "";
+    const offset = date.getTimezoneOffset();
+    return new Date(date.getTime() - offset * 60000).toISOString().slice(0, 16);
+  };
+  const formatDate = (value) => value
+    ? new Intl.DateTimeFormat("es-PE", { dateStyle: "short", timeStyle: "short", timeZone: CFG.TIME_ZONE || "America/Lima" }).format(new Date(value))
+    : "-";
+
+  function showLoading(text = "Procesando…") {
+    $("#loadingText").textContent = text;
+    $("#loading").classList.remove("hidden");
+  }
+
+  function hideLoading() {
+    $("#loading").classList.add("hidden");
+  }
+
+  function toast(message, type = "") {
+    const node = document.createElement("div");
+    node.className = `toast ${type}`.trim();
+    node.textContent = message;
+    $("#toastRegion").appendChild(node);
+    setTimeout(() => node.remove(), 4200);
+  }
+
+  function showFormMessage(id, message, ok = false) {
+    const node = $(id);
+    node.textContent = message;
+    node.className = `form-message ${ok ? "success" : "error"}`;
+  }
+
+  function errorMessage(error) {
+    const raw = error?.message || error?.error_description || String(error || "Error inesperado.");
+    if (/duplicate key|unique constraint/i.test(raw)) return "El código ya fue registrado.";
+    if (/invalid login credentials/i.test(raw)) return "Usuario o contraseña incorrectos.";
+    if (/failed to fetch|network/i.test(raw)) return "No se pudo conectar. Revise la señal de internet.";
+    return raw;
+  }
+
+  function operationCode(type) {
+    const d = new Date();
+    const date = `${String(d.getFullYear()).slice(-2)}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+    const time = `${String(d.getHours()).padStart(2, "0")}${String(d.getMinutes()).padStart(2, "0")}${String(d.getSeconds()).padStart(2, "0")}`;
+    const random = crypto.getRandomValues(new Uint16Array(1))[0].toString(36).toUpperCase().padStart(3, "0").slice(-3);
+    return `${TYPE_PREFIX[type]}-${date}-${time}-${random}`;
+  }
+
+  function internalEmail(username) {
+    return `${normalizeCode(username).toLowerCase()}@${CFG.INTERNAL_EMAIL_DOMAIN}`;
+  }
+
+  function showLogin() {
+    $("#loginView").classList.remove("hidden");
+    $("#appView").classList.add("hidden");
+  }
+
+  function showApp() {
+    $("#loginView").classList.add("hidden");
+    $("#appView").classList.remove("hidden");
+    const p = state.profile;
+    $("#profileCaption").textContent = `${p.usuario} · ${p.rol}${p.pdv_nombre ? ` · ${p.pdv_nombre}` : ""}`;
+    $("#accountInfo").innerHTML = `<strong>${escapeHtml(p.nombre)}</strong><small>${escapeHtml(p.usuario)} · ${escapeHtml(p.rol)}</small>${p.pdv_nombre ? `<small>${escapeHtml(p.pdv_nombre)}</small>` : ""}`;
+    const canManage = ["ADMINISTRADOR", "ENCARGADO"].includes(p.rol);
+    $("#usersNav").classList.toggle("hidden", !canManage);
+    $("#returnsNav").classList.toggle("hidden", !["ADMINISTRADOR", "ENCARGADO"].includes(p.rol));
+    $("#managerPdvField").classList.toggle("hidden", p.rol !== "ADMINISTRADOR");
+    $("#bulkPdvCard").classList.toggle("hidden", p.rol !== "ADMINISTRADOR");
+    if (p.rol === "ENCARGADO") {
+      $("#newRole").innerHTML = '<option value="PDV">PDV</option>';
+      $("#newRole").disabled = true;
+    }
+  }
+
+  async function loadProfile() {
+    const { data, error } = await db
+      .from("perfiles")
+      .select("id,usuario,nombre,rol,pdv_id,estado,pdvs:pdv_id(nombre,codigo)")
+      .eq("id", state.session.user.id)
+      .single();
+    if (error) throw error;
+    if (data.estado !== "ACTIVO") throw new Error("La cuenta está inactiva.");
+    state.profile = {
+      ...data,
+      pdv_nombre: data.pdvs?.nombre || "",
+      pdv_codigo: data.pdvs?.codigo || "",
+    };
+  }
+
+  async function loadPdvs() {
+    const { data, error } = await db.from("pdvs").select("id,codigo,nombre,region,area,encargado_id,estado").eq("estado", "ACTIVO").order("nombre");
+    if (error) throw error;
+    state.pdvs = data || [];
+    const options = state.pdvs.map((pdv) => `<option value="${pdv.id}">${escapeHtml(pdv.codigo)} · ${escapeHtml(pdv.nombre)}</option>`).join("");
+    $("#operationPdv").innerHTML = `<option value="">Seleccione</option>${options}`;
+    $("#newUserPdv").innerHTML = `<option value="">Seleccione</option>${options}`;
+  }
+
+  async function initializeSession(session) {
+    state.session = session;
+    await loadProfile();
+    await loadPdvs();
+    showApp();
+    await Promise.all([loadHome(), loadRecent()]);
+    await restoreDraft();
+  }
+
+  async function login(event) {
+    event.preventDefault();
+    $("#loginMessage").classList.add("hidden");
+    const username = normalizeCode($("#loginUser").value);
+    const password = $("#loginPassword").value;
+    if (!username || !password) return showFormMessage("#loginMessage", "Ingrese usuario y contraseña.");
+
+    showLoading("Iniciando sesión…");
+    try {
+      const { data, error } = await db.auth.signInWithPassword({ email: internalEmail(username), password });
+      if (error) throw error;
+      await initializeSession(data.session);
+      $("#loginForm").reset();
+    } catch (error) {
+      showFormMessage("#loginMessage", errorMessage(error));
+    } finally {
+      hideLoading();
+    }
+  }
+
+  async function logout() {
+    stopScanner();
+    showLoading("Cerrando sesión…");
+    try { await db.auth.signOut(); } finally {
+      clearState();
+      showLogin();
+      closeAllDialogs();
+      hideLoading();
+    }
+  }
+
+  function resetDevolucionState() {
+    state.devolucion = {
+      inverseOperation: null,
+      reception: null,
+      evidence: null,
+      photoDraft: null,
+    };
+    const form = $("#devolucionForm");
+    if (!form) return;
+    form.reset();
+    $("#devolucionFecha").value = localDateTimeValue();
+    $("#devolucionOtStatus").className = "form-message hidden";
+    $("#devolucionOtStatus").textContent = "";
+    $("#devolucionPhotoPreview").textContent = "Sin fotografía";
+    $("#devolucionPhotoInput").value = "";
+  }
+
+  function clearState() {
+    state.session = null;
+    state.profile = null;
+    state.pdvs = [];
+    state.users = [];
+    state.bulkPdvRows = [];
+    state.bulkPdvResults = [];
+    resetDevolucionState();
+    resetOperationState();
+  }
+
+  function switchView(name) {
+    if (name === "returns" && !["ADMINISTRADOR", "ENCARGADO"].includes(state.profile?.rol)) {
+      name = "home";
+    }
+    $$(".panel").forEach((panel) => panel.classList.remove("active"));
+    $$(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.view === name));
+    $(`#${name}Panel`)?.classList.add("active");
+    if (name === "records") loadRecords();
+    if (name === "users") loadUsersPanel();
+    if (name === "returns") loadDevoluciones();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function selectOperation(type) {
+    if (!TYPE_LABELS[type]) return;
+    switchView("new");
+    state.selectedType = type;
+    $("#operationPicker").classList.add("hidden");
+    $("#operationSetup").classList.remove("hidden");
+    $("#operationWorkspace").classList.add("hidden");
+    $("#newPanelTitle").textContent = TYPE_LABELS[type];
+    $("#setupTitle").textContent = TYPE_LABELS[type];
+    $("#truckFields").classList.toggle("hidden", !type.includes("CAMION"));
+    $("#parcelFields").classList.toggle("hidden", !type.includes("ENCOMIENDA"));
+    $("#operationOt").value = "";
+    $("#transportGuideNumber").value = "";
+    const choosePdv = state.profile.rol !== "PDV";
+    $("#pdvField").classList.toggle("hidden", !choosePdv);
+    if (!choosePdv) $("#operationPdv").value = state.profile.pdv_id || "";
+  }
+
+  function cancelOperationSelection() {
+    if (state.operation && !confirm("La operación permanecerá guardada como pendiente o en proceso. ¿Desea salir del registro?")) return;
+    resetOperationState();
+    $("#operationSetup").reset();
+    $("#operationSetup").classList.add("hidden");
+    $("#operationWorkspace").classList.add("hidden");
+    $("#operationPicker").classList.remove("hidden");
+    $("#newPanelTitle").textContent = "Selecciona una operación";
+  }
+
+  async function startOperation(event) {
+    event.preventDefault();
+    const type = state.selectedType;
+    const pdvId = state.profile.rol === "PDV" ? state.profile.pdv_id : $("#operationPdv").value;
+    if (!pdvId) return toast("Seleccione el PDV.", "error");
+
+    const ot = normalizeCode($("#operationOt").value);
+    const data = {
+      codigo: ot,
+      ot,
+      estado: "PENDIENTE",
+      tipo: type,
+      pdv_id: pdvId,
+      created_by: state.profile.id,
+      id_ruta: normalizeCode($("#routeId").value) || null,
+      placa: normalizeCode($("#vehiclePlate").value) || null,
+      empresa_encomienda: $("#parcelCompany").value.trim() || null,
+      numero_encomienda: normalizeCode($("#parcelNumber").value) || null,
+      guia_remision_transporte: NO_TRANSPORT_GUIDE_TYPES.has(type) ? null : (normalizeCode($("#transportGuideNumber").value) || null),
+    };
+
+    if (!data.ot) return toast("Ingrese o escanee la OT.", "error");
+    if (type.includes("CAMION") && !data.placa) return toast("Ingrese la placa de la unidad.", "error");
+
+    showLoading("Creando operación…");
+    try {
+      const { data: operation, error } = await db.from("operaciones").insert(data).select("*").single();
+      if (error) throw error;
+      state.operation = operation;
+      localStorage.setItem("controlLogisticoDraft", operation.id);
+      renderWorkspace();
+      await getGps();
+      toast("Operación iniciada.", "success");
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    } finally {
+      hideLoading();
+    }
+  }
+
+  function resetOperationState() {
+    state.selectedType = "";
+    state.operation = null;
+    state.items = [];
+    state.sacks = [];
+    state.packages = [];
+    state.seals = [];
+    state.evidences = [];
+    state.emptySacks = [];
+    state.transportGuide = null;
+    state.activeSack = null;
+    state.photoDrafts = new Map();
+    state.inversePhotos = [];
+    state.parcelPhotos = [];
+    state.emptySackPhotos = [];
+    state.gps = null;
+    state.receiptItemType = "SACO";
+    stopScanner();
+    renderItems();
+    renderSacks();
+    renderGeneralPhotos("inverse");
+    renderGeneralPhotos("parcel");
+    renderGeneralPhotos("empty");
+    renderEmptySacks();
+    $$(".photo-preview").forEach((node) => { node.textContent = "Sin fotografía"; });
+    $$(".photo-slot input").forEach((input) => { input.value = ""; });
+    $("#emptySackPhotoInput").value = "";
+    $("#manualEmptySackCode").value = "";
+    $("#manualEmptySackQuantity").value = "1";
+    $("#manualEmptySackObservation").value = "";
+    $("#transportGuideInput").value = "";
+    $("#transportGuideNumber").value = "";
+    $("#operationOt").value = "";
+    $("#gpsStatus").className = "gps-box";
+    $("#gpsStatus").textContent = "Ubicación pendiente.";
+    renderTransportGuide();
+  }
+
+  function markOperationInProcess() {
+    if (!state.operation || state.operation.estado === "COMPLETADO" || state.operation.estado === "ANULADO") return;
+    if (state.operation.estado !== "EN_PROCESO") {
+      state.operation.estado = "EN_PROCESO";
+      renderOperationStatus();
+    }
+  }
+
+  function renderOperationStatus() {
+    const status = state.operation?.estado || "PENDIENTE";
+    const node = $("#activeOperationStatus");
+    if (!node) return;
+    node.className = `status-pill ${statusClass(status)}`;
+    node.textContent = statusLabel(status);
+    $("#finishOperationButton")?.classList.toggle("hidden", status === "COMPLETADO" || status === "ANULADO");
+    $("#deleteActiveOperationButton")?.classList.toggle("hidden", state.profile?.rol !== "ADMINISTRADOR" || !["PENDIENTE", "EN_PROCESO"].includes(status));
+  }
+
+  function renderWorkspace() {
+    const type = state.operation.tipo;
+    state.selectedType = type;
+    $("#operationPicker").classList.add("hidden");
+    $("#operationSetup").classList.add("hidden");
+    $("#operationWorkspace").classList.remove("hidden");
+    $("#newPanelTitle").textContent = TYPE_LABELS[type];
+    $("#activeOperationCode").textContent = state.operation.codigo;
+    $("#activeOperationLabel").textContent = TYPE_LABELS[type];
+    $("#transportGuideNumber").value = state.operation.guia_remision_transporte || "";
+    renderOperationStatus();
+
+    $("#transportGuideSection").classList.toggle("hidden", !requiresTransportGuide());
+    $("#truckArrivalSection").classList.toggle("hidden", type !== "RECEPCION_CAMION");
+    $("#receiptItemsSection").classList.toggle("hidden", !RECEIPT_TYPES.has(type));
+    $("#inverseSection").classList.toggle("hidden", !INVERSE_TYPES.has(type));
+    $("#emptySacksSection").classList.toggle("hidden", !EMPTY_SACK_TYPES.has(type));
+    $("#truckDepartureSection").classList.toggle("hidden", type !== "RECEPCION_CAMION");
+    $("#parcelPhotosSection").classList.toggle("hidden", !["RECEPCION_ENCOMIENDA", "RECOJO_ALMACEN"].includes(type));
+    $("#loadPhotoSlot").classList.toggle("hidden", type !== "RECEPCION_CAMION");
+    $("#itemTypeChooser").classList.toggle("hidden", ["RECEPCION_ENCOMIENDA", "RECOJO_ALMACEN"].includes(type));
+    $("#parcelPhotosSection .step-title strong").textContent = type === "RECOJO_ALMACEN" ? "Evidencias del recojo en almacén" : "Evidencias de recepción";
+    $("#receiptItemsTitle").textContent = type === "RECEPCION_ENCOMIENDA"
+      ? "Sacos recibidos por encomienda"
+      : type === "RECOJO_ALMACEN" ? "Sacos recibidos en almacén" : "Sacos y bultos recibidos";
+    $("#receiptStepNumber").textContent = type === "RECEPCION_CAMION" ? "3" : "2";
+    $("#parcelPhotosSection .step-title > span").textContent = "2";
+    $("#truckDepartureSection .step-title > span").textContent = "4";
+    if (["RECEPCION_ENCOMIENDA", "RECOJO_ALMACEN"].includes(type)) state.receiptItemType = "SACO";
+    setEmptySackType("CON_CODIGO");
+
+    createSealCards();
+    renderItems();
+    renderSacks();
+    renderEmptySacks();
+    renderGeneralPhotos("inverse");
+    renderGeneralPhotos("parcel");
+    renderGeneralPhotos("empty");
+    renderExistingEvidenceMarkers();
+    renderTransportGuide();
+    renderGps();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function createSealCards() {
+    const make = (stage, number) => {
+      const key = `PRECINTO_${stage}:${number}`;
+      const seal = state.seals.find((item) => item.etapa === stage && Number(item.numero) === number);
+      const evidence = state.evidences.find((item) => item.categoria === `PRECINTO_${stage}` && item.referencia_codigo === String(number));
+      return `<div class="seal-card" data-seal-stage="${stage}" data-seal-number="${number}">
+        <h4>Precinto ${stage.toLowerCase()} ${number}${number === 1 ? " *" : ""}</h4>
+        <div class="scan-input"><input class="seal-code" value="${escapeHtml(seal?.codigo || "")}" autocapitalize="characters" placeholder="Código"><button type="button" data-scan-seal="${stage}:${number}" data-scan-label="Precinto ${stage.toLowerCase()} ${number}">▣</button></div>
+        <input class="seal-photo" type="file" accept="image/*" data-photo-key="${key}">
+        <div class="photo-preview">${evidence ? "Fotografía guardada" : "Sin fotografía"}</div>
+      </div>`;
+    };
+    $("#arrivalSeals").innerHTML = [1, 2, 3, 4].map((number) => make("LLEGADA", number)).join("");
+    $("#departureSeals").innerHTML = [1, 2, 3, 4].map((number) => make("SALIDA", number)).join("");
+  }
+
+  async function restoreDraft() {
+    const id = localStorage.getItem("controlLogisticoDraft");
+    if (!id) return;
+    try {
+      const { data, error } = await db.from("operaciones").select("*").eq("id", id).in("estado", ["PENDIENTE", "EN_PROCESO"]).maybeSingle();
+      if (error || !data) return localStorage.removeItem("controlLogisticoDraft");
+      await resumeOperation(data.id, false);
+      toast(`Borrador recuperado: ${data.codigo}`);
+    } catch (error) {
+      console.warn(error);
+    }
+  }
+
+  async function resumeOperation(id, navigate = true) {
+    showLoading("Recuperando borrador…");
+    try {
+      const [operationResult, itemsResult, sacksResult, packagesResult, sealsResult, evidencesResult, emptySacksResult] = await Promise.all([
+        db.from("operaciones").select("*").eq("id", id).single(),
+        db.from("items_recepcion").select("*").eq("operacion_id", id).order("orden"),
+        db.from("costales").select("*").eq("operacion_id", id).order("orden"),
+        db.from("paquetes").select("*").eq("operacion_id", id).order("orden"),
+        db.from("precintos").select("*").eq("operacion_id", id).order("numero"),
+        db.from("evidencias").select("*").eq("operacion_id", id).order("created_at"),
+        db.from("sacos_vacios").select("*").eq("operacion_id", id).order("created_at"),
+      ]);
+      for (const result of [operationResult, itemsResult, sacksResult, packagesResult, sealsResult, evidencesResult, emptySacksResult]) if (result.error) throw result.error;
+      if (!["PENDIENTE", "EN_PROCESO"].includes(operationResult.data.estado)) throw new Error("La operación ya no está disponible para edición.");
+      resetOperationState();
+      state.operation = operationResult.data;
+      state.items = itemsResult.data || [];
+      state.sacks = sacksResult.data || [];
+      state.packages = packagesResult.data || [];
+      state.seals = sealsResult.data || [];
+      state.evidences = evidencesResult.data || [];
+      state.emptySacks = emptySacksResult.data || [];
+      state.transportGuide = null;
+      state.activeSack = state.sacks.find((item) => item.estado === "ABIERTO") || null;
+      localStorage.setItem("controlLogisticoDraft", id);
+      if (navigate) switchView("new");
+      renderWorkspace();
+      closeAllDialogs();
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    } finally {
+      hideLoading();
+    }
+  }
+
+  function setItemType(type) {
+    state.receiptItemType = type;
+    $$('[data-item-type]').forEach((button) => button.classList.toggle("active", button.dataset.itemType === type));
+  }
+
+  async function addReceiptCode(raw) {
+    const code = normalizeCode(raw);
+    if (!state.operation || !code) return false;
+    if (state.items.some((item) => normalizeCode(item.codigo) === code)) {
+      toast(`El código ${code} ya fue escaneado.`, "error");
+      return false;
+    }
+    try {
+      const order = state.items.reduce((max, item) => Math.max(max, Number(item.orden) || 0), 0) + 1;
+      const { data, error } = await db.from("items_recepcion").insert({
+        operacion_id: state.operation.id,
+        tipo: ["RECEPCION_ENCOMIENDA", "RECOJO_ALMACEN"].includes(state.operation.tipo) ? "SACO" : state.receiptItemType,
+        codigo: code,
+        orden: order,
+        escaneado_por: state.profile.id,
+      }).select("*").single();
+      if (error) throw error;
+      state.items.push(data);
+      markOperationInProcess();
+      renderItems();
+      vibrate(90);
+      return true;
+    } catch (error) {
+      toast(errorMessage(error), "error");
+      return false;
+    }
+  }
+
+  async function deleteReceiptItem(id) {
+    if (!confirm("¿Eliminar este escaneo?")) return;
+    const { error } = await db.from("items_recepcion").delete().eq("id", id);
+    if (error) return toast(errorMessage(error), "error");
+    state.items = state.items.filter((item) => item.id !== id);
+    renderItems();
+  }
+
+  function renderItems() {
+    const list = $("#receiptItemsList");
+    if (!list) return;
+    $("#receiptItemCount").textContent = String(state.items.length);
+    list.innerHTML = state.items.length ? state.items.map((item) => `
+      <div class="scan-item"><div class="scan-item-main"><small>${escapeHtml(item.tipo.replaceAll("_", " "))} · ${formatDate(item.escaneado_at)}</small><strong>${escapeHtml(item.codigo)}</strong></div><button class="delete-button" data-delete-item="${item.id}" aria-label="Eliminar">×</button></div>
+    `).join("") : '<div class="empty-state">Aún no hay códigos escaneados.</div>';
+  }
+
+  function emptySackCounts() {
+    const withCode = state.emptySacks.filter((item) => item.tipo === "CON_CODIGO").reduce((total, item) => total + Number(item.cantidad || 0), 0);
+    const withoutCode = state.emptySacks.filter((item) => item.tipo === "SIN_CODIGO").reduce((total, item) => total + Number(item.cantidad || 0), 0);
+    return { withCode, withoutCode, total: withCode + withoutCode };
+  }
+
+  function setEmptySackType(type) {
+    const selected = type === "SIN_CODIGO" ? "SIN_CODIGO" : "CON_CODIGO";
+    $("#emptySackCodePanel")?.classList.toggle("hidden", selected !== "CON_CODIGO");
+    $("#emptySackNoCodePanel")?.classList.toggle("hidden", selected !== "SIN_CODIGO");
+    $$('[data-empty-sack-type]').forEach((button) => button.classList.toggle("active", button.dataset.emptySackType === selected));
+  }
+
+  async function addEmptySackCode(raw) {
+    const code = normalizeCode(raw);
+    if (!hasEmptySackControl() || !state.operation || !code) return false;
+    if (state.emptySacks.some((item) => item.tipo === "CON_CODIGO" && normalizeCode(item.codigo) === code)) {
+      toast(`El saco vacío ${code} ya fue registrado.`, "error");
+      return false;
+    }
+    try {
+      const { data, error } = await db.from("sacos_vacios").insert({
+        operacion_id: state.operation.id,
+        tipo: "CON_CODIGO",
+        codigo: code,
+        cantidad: 1,
+        registrado_por: state.profile.id,
+      }).select("*").single();
+      if (error) throw error;
+      state.emptySacks.push(data);
+      markOperationInProcess();
+      renderEmptySacks();
+      vibrate(90);
+      return true;
+    } catch (error) {
+      toast(errorMessage(error), "error");
+      return false;
+    }
+  }
+
+  async function addEmptySackWithoutCode() {
+    if (!hasEmptySackControl() || !state.operation) return false;
+    const quantity = Number.parseInt($("#manualEmptySackQuantity").value, 10);
+    const observation = $("#manualEmptySackObservation").value.trim();
+    if (!Number.isInteger(quantity) || quantity < 1) {
+      toast("Ingrese una cantidad válida de sacos sin código.", "error");
+      return false;
+    }
+    try {
+      const { data, error } = await db.from("sacos_vacios").insert({
+        operacion_id: state.operation.id,
+        tipo: "SIN_CODIGO",
+        codigo: null,
+        cantidad: quantity,
+        observacion: observation || null,
+        registrado_por: state.profile.id,
+      }).select("*").single();
+      if (error) throw error;
+      state.emptySacks.push(data);
+      markOperationInProcess();
+      $("#manualEmptySackQuantity").value = "1";
+      $("#manualEmptySackObservation").value = "";
+      renderEmptySacks();
+      vibrate([80, 50, 80]);
+      return true;
+    } catch (error) {
+      toast(errorMessage(error), "error");
+      return false;
+    }
+  }
+
+  async function deleteEmptySack(id) {
+    if (!confirm("¿Eliminar este registro de sacos vacíos?")) return;
+    const { error } = await db.from("sacos_vacios").delete().eq("id", id);
+    if (error) return toast(errorMessage(error), "error");
+    state.emptySacks = state.emptySacks.filter((item) => item.id !== id);
+    renderEmptySacks();
+  }
+
+  function renderEmptySacks() {
+    const list = $("#emptySackList");
+    if (!list) return;
+    const counts = emptySackCounts();
+    $("#emptySackTotalCount").textContent = String(counts.total);
+    $("#emptySackCodeCount").textContent = String(counts.withCode);
+    $("#emptySackNoCodeCount").textContent = String(counts.withoutCode);
+    list.innerHTML = state.emptySacks.length ? state.emptySacks.map((item) => {
+      const label = item.tipo === "CON_CODIGO" ? escapeHtml(item.codigo) : `${Number(item.cantidad || 0)} saco(s) sin código`;
+      const detail = item.tipo === "CON_CODIGO" ? "Con código" : `Sin código${item.observacion ? ` · ${escapeHtml(item.observacion)}` : ""}`;
+      return `<div class="scan-item"><div class="scan-item-main"><small>${detail} · ${formatDate(item.created_at)}</small><strong>${label}</strong></div><button class="delete-button" data-delete-empty-sack="${item.id}" aria-label="Eliminar">×</button></div>`;
+    }).join("") : '<div class="empty-state">Aún no hay sacos vacíos registrados.</div>';
+  }
+
+  async function openSack(raw) {
+    const code = normalizeCode(raw);
+    if (!state.operation || !code) return false;
+    if (state.activeSack) {
+      toast(`Primero cierre el costal ${state.activeSack.codigo}.`, "error");
+      return false;
+    }
+    if (state.sacks.some((item) => normalizeCode(item.codigo) === code)) {
+      toast(`El costal ${code} ya pertenece a esta operación.`, "error");
+      return false;
+    }
+    try {
+      const order = state.sacks.reduce((max, item) => Math.max(max, Number(item.orden) || 0), 0) + 1;
+      const { data, error } = await db.from("costales").insert({
+        operacion_id: state.operation.id,
+        codigo: code,
+        orden: order,
+        creado_por: state.profile.id,
+      }).select("*").single();
+      if (error) throw error;
+      state.sacks.push(data);
+      markOperationInProcess();
+      state.activeSack = data;
+      renderSacks();
+      vibrate([100, 60, 100]);
+      return true;
+    } catch (error) {
+      toast(errorMessage(error), "error");
+      return false;
+    }
+  }
+
+  async function addPackage(raw) {
+    const code = normalizeCode(raw);
+    if (!state.activeSack) {
+      toast("Primero abra un costal.", "error");
+      return false;
+    }
+    if (!code) return false;
+    if (!code.startsWith("JPE")) {
+      toast("El código del paquete debe comenzar con JPE.", "error");
+      return false;
+    }
+    if (state.packages.some((item) => normalizeCode(item.codigo) === code)) {
+      toast(`El paquete ${code} ya fue escaneado.`, "error");
+      return false;
+    }
+    try {
+      const order = state.packages.filter((item) => item.costal_id === state.activeSack.id).length + 1;
+      const { data, error } = await db.from("paquetes").insert({
+        operacion_id: state.operation.id,
+        costal_id: state.activeSack.id,
+        codigo: code,
+        orden: order,
+        escaneado_por: state.profile.id,
+      }).select("*").single();
+      if (error) throw error;
+      state.packages.push(data);
+      markOperationInProcess();
+      renderSacks();
+      vibrate(80);
+      return true;
+    } catch (error) {
+      toast(errorMessage(error), "error");
+      return false;
+    }
+  }
+
+  async function closeSack() {
+    if (!state.activeSack) return;
+    const count = state.packages.filter((item) => item.costal_id === state.activeSack.id).length;
+    if (!count) return toast("El costal debe contener al menos un paquete.", "error");
+    const { data, error } = await db.from("costales").update({ estado: "CERRADO", cerrado_at: new Date().toISOString() }).eq("id", state.activeSack.id).select("*").single();
+    if (error) return toast(errorMessage(error), "error");
+    state.sacks = state.sacks.map((item) => item.id === data.id ? data : item);
+    markOperationInProcess();
+    state.activeSack = null;
+    renderSacks();
+    toast("Costal cerrado.", "success");
+  }
+
+  async function deletePackage(id) {
+    if (!confirm("¿Eliminar este paquete?")) return;
+    const { error } = await db.from("paquetes").delete().eq("id", id);
+    if (error) return toast(errorMessage(error), "error");
+    state.packages = state.packages.filter((item) => item.id !== id);
+    renderSacks();
+  }
+
+  async function deleteSack(id) {
+    const count = state.packages.filter((item) => item.costal_id === id).length;
+    if (!confirm(`¿Eliminar el costal y sus ${count} paquetes?`)) return;
+    const { error } = await db.from("costales").delete().eq("id", id);
+    if (error) return toast(errorMessage(error), "error");
+    state.sacks = state.sacks.filter((item) => item.id !== id);
+    state.packages = state.packages.filter((item) => item.costal_id !== id);
+    if (state.activeSack?.id === id) state.activeSack = null;
+    renderSacks();
+  }
+
+  function renderSacks() {
+    const list = $("#sackList");
+    if (!list) return;
+    $("#sackCount").textContent = String(state.sacks.length);
+    $("#packageCount").textContent = String(state.packages.length);
+    const active = state.activeSack;
+    $("#activeSackBox").classList.toggle("empty", !active);
+    $("#activeSackCode").textContent = active?.codigo || (active ? "SIN CÓDIGO" : "Ninguno");
+    const activeCount = active ? state.packages.filter((item) => item.costal_id === active.id).length : 0;
+    $("#activeSackCount").textContent = active ? `${activeCount} paquete(s) asignado(s)` : "Escanee un costal para comenzar";
+    $("#closeSackButton").disabled = !active;
+    $("#packageScannerButton").disabled = !active;
+    list.innerHTML = state.sacks.length ? state.sacks.map((sack) => {
+      const packages = state.packages.filter((item) => item.costal_id === sack.id);
+      return `<div class="sack-card"><div class="sack-head"><div><small>Costal ${sack.orden} · ${sack.estado}</small><strong>${escapeHtml(sack.codigo || "SIN CÓDIGO")}</strong></div><button class="delete-button" data-delete-sack="${sack.id}">×</button></div><div class="sack-packages">${packages.length ? packages.map((item) => `<span>${escapeHtml(item.codigo)} <button class="link-button danger-text" data-delete-package="${item.id}">quitar</button></span>`).join(" · ") : "Sin paquetes"}</div></div>`;
+    }).join("") : '<div class="empty-state">Aún no hay costales registrados.</div>';
+  }
+
+  async function getGps() {
+    if (!navigator.geolocation) {
+      state.gps = null;
+      renderGps("El dispositivo no admite ubicación.", true);
+      return;
+    }
+    renderGps("Obteniendo ubicación…");
+    return new Promise((resolve) => navigator.geolocation.getCurrentPosition(
+      (position) => {
+        state.gps = {
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+          accuracy: position.coords.accuracy,
+        };
+        renderGps();
+        resolve(state.gps);
+      },
+      (error) => {
+        state.gps = null;
+        renderGps(`No se obtuvo la ubicación: ${error.message}`, true);
+        resolve(null);
+      },
+      { enableHighAccuracy: true, timeout: 18000, maximumAge: 30000 },
+    ));
+  }
+
+  function renderGps(message = "", error = false) {
+    const node = $("#gpsStatus");
+    if (!node) return;
+    if (state.gps) {
+      node.className = "gps-box ok";
+      node.textContent = `Ubicación lista · ${state.gps.latitude.toFixed(6)}, ${state.gps.longitude.toFixed(6)} · precisión ±${Math.round(state.gps.accuracy)} m`;
+    } else {
+      node.className = `gps-box${error ? " error" : ""}`;
+      node.textContent = message || "Ubicación pendiente.";
+    }
+  }
+
+  async function processImage(file) {
+    if (!file || !file.type.startsWith("image/")) throw new Error("Seleccione una imagen válida.");
+    const source = await fileToDataUrl(file);
+    const image = await loadImage(source);
+    const max = Number(CFG.PHOTO_MAX_SIDE || 1600);
+    let { width, height } = image;
+    if (Math.max(width, height) > max) {
+      const scale = max / Math.max(width, height);
+      width = Math.round(width * scale);
+      height = Math.round(height * scale);
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    canvas.getContext("2d", { alpha: false }).drawImage(image, 0, 0, width, height);
+    return canvas.toDataURL("image/jpeg", Number(CFG.PHOTO_QUALITY || .78));
+  }
+
+  function fileToDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error("No se pudo leer el archivo."));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error("No se pudo procesar la fotografía."));
+      image.src = src;
+    });
+  }
+
+  async function handlePhotoSlot(input) {
+    const file = input.files?.[0];
+    if (!file) return;
+    showLoading("Procesando fotografía…");
+    try {
+      const slot = input.closest(".photo-slot");
+      const sealCard = input.closest(".seal-card");
+      const key = input.dataset.photoKey || slot?.dataset.photoSlot;
+      const category = key?.includes(":") ? key.split(":")[0] : key;
+      const reference = key?.includes(":") ? key.split(":")[1] : "";
+      const label = slot?.dataset.photoLabel || sealCard?.querySelector("h4")?.textContent || category;
+      const dataUrl = await processImage(file);
+      state.photoDrafts.set(key, { key, category, reference, label, dataUrl, uploaded: false });
+      const preview = (slot || sealCard).querySelector(".photo-preview");
+      preview.innerHTML = `<img src="${dataUrl}" alt="${escapeHtml(label)}">`;
+    } catch (error) {
+      toast(errorMessage(error), "error");
+      input.value = "";
+    } finally {
+      hideLoading();
+    }
+  }
+
+  function currentTransportGuideEvidence() {
+    return state.evidences.find((item) => item.categoria === "GUIA_REMISION_TRANSPORTE");
+  }
+
+  function renderTransportGuide() {
+    const preview = $("#transportGuidePreview");
+    const removeButton = $("#removeTransportGuideButton");
+    if (!preview || !removeButton) return;
+    const local = state.transportGuide;
+    const existing = currentTransportGuideEvidence();
+    if (local) {
+      preview.innerHTML = local.mimeType === "application/pdf"
+        ? `<strong>PDF listo:</strong> ${escapeHtml(local.fileName || "guia-remision.pdf")}`
+        : `<img src="${local.dataUrl}" alt="Guía de remisión transporte">`;
+      removeButton.classList.remove("hidden");
+      return;
+    }
+    if (existing) {
+      preview.innerHTML = `<strong>Archivo guardado:</strong> ${escapeHtml(existing.nombre_archivo || "Guía de remisión transporte")}`;
+      removeButton.classList.remove("hidden");
+      return;
+    }
+    preview.textContent = "Sin documento adjunto.";
+    removeButton.classList.add("hidden");
+  }
+
+  async function deleteStoredEvidence(evidenceId, ask = true) {
+    const evidence = state.evidences.find((item) => item.id === evidenceId);
+    if (!evidence) return;
+    if (ask && !confirm("¿Eliminar la guía de remisión adjunta?")) return;
+    showLoading("Eliminando guía…");
+    try {
+      await callDrive("ELIMINAR_EVIDENCIA", { fileId: evidence.drive_file_id });
+      const { error } = await db.from("evidencias").delete().eq("id", evidence.id);
+      if (error) throw error;
+      state.evidences = state.evidences.filter((item) => item.id !== evidence.id);
+      if (state.transportGuide?.existingId === evidence.id || state.transportGuide?.category === evidence.categoria) state.transportGuide = null;
+      renderTransportGuide();
+      toast("Guía eliminada. Puede adjuntar otra antes de completar.", "success");
+    } catch (error) {
+      toast(errorMessage(error), "error");
+      throw error;
+    } finally {
+      hideLoading();
+    }
+  }
+
+  async function handleTransportGuide(input) {
+    const file = input.files?.[0];
+    if (!file) return;
+    const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+    if (!isPdf && !file.type.startsWith("image/")) {
+      toast("Adjunte una imagen o un archivo PDF.", "error");
+      input.value = "";
+      return;
+    }
+    if (file.size > 6 * 1024 * 1024) {
+      toast("La guía no puede superar 6 MB.", "error");
+      input.value = "";
+      return;
+    }
+    const existing = currentTransportGuideEvidence();
+    if (existing) {
+      try {
+        await deleteStoredEvidence(existing.id, false);
+      } catch (error) {
+        input.value = "";
+        return;
+      }
+    }
+    showLoading("Procesando guía…");
+    try {
+      const dataUrl = isPdf
+        ? (await fileToDataUrl(file)).replace(/^data:;base64,/, "data:application/pdf;base64,")
+        : await processImage(file);
+      state.transportGuide = {
+        dataUrl,
+        fileName: file.name,
+        mimeType: isPdf ? "application/pdf" : "image/jpeg",
+        category: "GUIA_REMISION_TRANSPORTE",
+        reference: "GUIA-TRANSPORTE",
+        label: "Guía de remisión transporte",
+        uploaded: false,
+      };
+      markOperationInProcess();
+      await uploadEvidence(state.transportGuide);
+      renderTransportGuide();
+    } catch (error) {
+      toast(errorMessage(error), "error");
+      input.value = "";
+    } finally {
+      hideLoading();
+    }
+  }
+
+  async function removeTransportGuide() {
+    if (state.transportGuide && !state.transportGuide.uploaded) {
+      state.transportGuide = null;
+      $("#transportGuideInput").value = "";
+      renderTransportGuide();
+      return;
+    }
+    const existing = currentTransportGuideEvidence();
+    if (existing) {
+      try {
+        await deleteStoredEvidence(existing.id);
+      } catch (error) {
+        // El mensaje ya fue mostrado por deleteStoredEvidence.
+      }
+    }
+  }
+
+  async function handleGeneralPhotos(input, kind) {
+    const max = Number(CFG.MAX_GENERAL_PHOTOS || 3);
+    const files = Array.from(input.files || []).slice(0, max);
+    if (!files.length) return;
+    showLoading("Procesando fotografías…");
+    try {
+      const processed = [];
+      for (const file of files) processed.push({ dataUrl: await processImage(file), uploaded: false });
+      if (kind === "inverse") state.inversePhotos = processed;
+      else if (kind === "empty") state.emptySackPhotos = processed;
+      else state.parcelPhotos = processed;
+      renderGeneralPhotos(kind);
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    } finally {
+      hideLoading();
+    }
+  }
+
+  function renderGeneralPhotos(kind) {
+    const photos = kind === "inverse" ? state.inversePhotos : kind === "empty" ? state.emptySackPhotos : state.parcelPhotos;
+    const target = kind === "inverse" ? $("#inversePhotoPreview") : kind === "empty" ? $("#emptySackPhotoPreview") : $("#parcelPhotoPreview");
+    if (!target) return;
+    if (!photos.length && kind === "empty" && state.evidences.some((item) => item.categoria === "SACOS_VACIOS")) {
+      target.innerHTML = '<div class="photo-preview">Fotografías guardadas en Drive</div>';
+      return;
+    }
+    target.innerHTML = photos.map((photo, index) => `<div class="photo-slot"><div class="photo-preview"><img src="${photo.dataUrl}" alt="Evidencia ${index + 1}"></div><button type="button" class="link-button danger-text" data-remove-photo="${kind}:${index}">Quitar</button></div>`).join("");
+  }
+
+  function removeGeneralPhoto(kind, index) {
+    if (kind === "inverse") state.inversePhotos.splice(index, 1);
+    else if (kind === "empty") state.emptySackPhotos.splice(index, 1);
+    else state.parcelPhotos.splice(index, 1);
+    renderGeneralPhotos(kind);
+  }
+
+  function renderExistingEvidenceMarkers() {
+    $$(".photo-slot[data-photo-slot]").forEach((slot) => {
+      const category = slot.dataset.photoSlot;
+      if (state.evidences.some((item) => item.categoria === category)) slot.querySelector(".photo-preview").textContent = "Fotografía guardada";
+    });
+  }
+
+  async function callDrive(action, payload) {
+    if (!CFG.DRIVE_API_URL) throw new Error("Falta publicar el puente de Google Drive y colocar su URL en config.js.");
+    const { data: sessionData } = await db.auth.getSession();
+    const token = sessionData.session?.access_token;
+    if (!token) throw new Error("La sesión venció.");
+    const response = await fetch(CFG.DRIVE_API_URL, {
+      method: "POST",
+      body: JSON.stringify({ accion: action, accessToken: token, ...payload }),
+      cache: "no-store",
+    });
+    const result = await response.json();
+    if (!result.ok) throw new Error(result.error || "Google Drive rechazó la operación.");
+    return result;
+  }
+
+  async function uploadEvidence(photo) {
+    const existing = state.evidences.find((item) => item.categoria === photo.category && String(item.referencia_codigo || "") === String(photo.reference || ""));
+    if (existing) return existing;
+    const result = await callDrive("SUBIR_EVIDENCIA", {
+      codigoOperacion: state.operation.codigo,
+      categoria: photo.category,
+      referenciaCodigo: photo.reference || "GENERAL",
+      dataUrl: photo.dataUrl,
+      nombreArchivo: photo.fileName || "",
+    });
+    const { data, error } = await db.from("evidencias").insert({
+      operacion_id: state.operation.id,
+      categoria: photo.category,
+      etiqueta: photo.label,
+      referencia_codigo: photo.reference || null,
+      drive_file_id: result.fileId,
+      nombre_archivo: result.nombre,
+      mime_type: result.mimeType,
+      registrado_por: state.profile.id,
+    }).select("*").single();
+    if (error) throw error;
+    state.evidences.push(data);
+    photo.uploaded = true;
+    if (photo.category === "GUIA_REMISION_TRANSPORTE") photo.existingId = data.id;
+    markOperationInProcess();
+    return data;
+  }
+
+  function sealValues(stage) {
+    return $$(`[data-seal-stage="${stage}"]`).map((card) => ({
+      stage,
+      number: Number(card.dataset.sealNumber),
+      code: normalizeCode(card.querySelector(".seal-code").value),
+      photo: state.photoDrafts.get(`PRECINTO_${stage}:${card.dataset.sealNumber}`),
+      existingPhoto: state.evidences.find((item) => item.categoria === `PRECINTO_${stage}` && item.referencia_codigo === card.dataset.sealNumber),
+    }));
+  }
+
+  async function syncTransportGuide() {
+    const existing = currentTransportGuideEvidence();
+    if (existing) return existing;
+    if (!state.transportGuide) throw new Error("Debe adjuntar la guía de remisión transporte.");
+    return uploadEvidence(state.transportGuide);
+  }
+
+  async function syncOperationMetadata() {
+    const numeroGuia = normalizeCode($("#transportGuideNumber").value) || null;
+    if (numeroGuia === (state.operation.guia_remision_transporte || null)) return;
+    const payload = { guia_remision_transporte: numeroGuia };
+    if (numeroGuia && state.operation.estado === "PENDIENTE") payload.estado = "EN_PROCESO";
+    const { data, error } = await db.from("operaciones")
+      .update(payload)
+      .eq("id", state.operation.id)
+      .select("*")
+      .single();
+    if (error) throw error;
+    state.operation = data;
+    renderOperationStatus();
+  }
+
+  async function syncTruckReceipt() {
+    const arrivalPhoto = state.photoDrafts.get("LLEGADA_UNIDAD") || state.evidences.find((item) => item.categoria === "LLEGADA_UNIDAD");
+    const loadPhoto = state.photoDrafts.get("CARGA_RECIBIDA") || state.evidences.find((item) => item.categoria === "CARGA_RECIBIDA");
+    if (!arrivalPhoto) throw new Error("Debe adjuntar la foto de llegada de la unidad.");
+    if (!loadPhoto) throw new Error("Debe adjuntar la foto de los sacos o bultos recibidos.");
+
+    for (const photo of state.photoDrafts.values()) {
+      if (!photo.category.startsWith("PRECINTO_")) await uploadEvidence(photo);
+    }
+
+    for (const stage of ["LLEGADA", "SALIDA"]) {
+      const values = sealValues(stage);
+      const first = values[0];
+      if (!first.code) throw new Error(`Debe escanear el precinto de ${stage.toLowerCase()} 1.`);
+      if (!first.photo && !first.existingPhoto) throw new Error(`Debe fotografiar el precinto de ${stage.toLowerCase()} 1.`);
+
+      for (const seal of values) {
+        if ((seal.code && !seal.photo && !seal.existingPhoto) || (!seal.code && (seal.photo || seal.existingPhoto))) {
+          throw new Error(`Complete el código y la foto del precinto de ${stage.toLowerCase()} ${seal.number}.`);
+        }
+        if (!seal.code) continue;
+        const { data, error } = await db.from("precintos").upsert({
+          operacion_id: state.operation.id,
+          etapa: stage,
+          numero: seal.number,
+          codigo: seal.code,
+          registrado_por: state.profile.id,
+        }, { onConflict: "operacion_id,etapa,numero" }).select("*").single();
+        if (error) throw error;
+        state.seals = state.seals.filter((item) => !(item.etapa === stage && Number(item.numero) === seal.number));
+        state.seals.push(data);
+        if (seal.photo) await uploadEvidence(seal.photo);
+      }
+    }
+  }
+
+  async function syncGeneralEvidence() {
+    if (["RECEPCION_ENCOMIENDA", "RECOJO_ALMACEN"].includes(state.operation.tipo)) {
+      const existing = state.evidences.filter((item) => item.categoria === "EVIDENCIA_GENERAL");
+      if (!state.parcelPhotos.length && !existing.length) throw new Error("Debe adjuntar al menos una fotografía de la recepción.");
+      for (let index = 0; index < state.parcelPhotos.length; index += 1) {
+        const label = state.operation.tipo === "RECOJO_ALMACEN" ? "Evidencia de recojo en almacén" : "Evidencia de recepción";
+        await uploadEvidence({ ...state.parcelPhotos[index], category: "EVIDENCIA_GENERAL", reference: `RECEPCION-${index + 1}`, label: `${label} ${index + 1}` });
+      }
+    }
+    if (INVERSE_TYPES.has(state.operation.tipo)) {
+      const existing = state.evidences.filter((item) => item.categoria === "LOGISTICA_INVERSA");
+      if (!state.inversePhotos.length && !existing.length) throw new Error("Debe adjuntar al menos una fotografía de la logística inversa.");
+      for (let index = 0; index < state.inversePhotos.length; index += 1) {
+        await uploadEvidence({ ...state.inversePhotos[index], category: "LOGISTICA_INVERSA", reference: `INVERSA-${index + 1}`, label: `Evidencia de logística inversa ${index + 1}` });
+      }
+    }
+  }
+
+  async function syncEmptySackEvidence() {
+    if (!hasEmptySackControl()) return;
+    const counts = emptySackCounts();
+    if (!counts.total) return;
+    const existing = state.evidences.filter((item) => item.categoria === "SACOS_VACIOS");
+    if (!state.emptySackPhotos.length && !existing.length) throw new Error("Debe adjuntar al menos una fotografía de los sacos vacíos retornados.");
+    for (let index = 0; index < state.emptySackPhotos.length; index += 1) {
+      await uploadEvidence({ ...state.emptySackPhotos[index], category: "SACOS_VACIOS", reference: `SACOS-VACIOS-${index + 1}`, label: `Evidencia de sacos vacíos ${index + 1}` });
+    }
+  }
+
+  async function finishOperation() {
+    if (!state.operation) return;
+    if (!state.gps) return toast("Obtenga la ubicación GPS antes de finalizar.", "error");
+    if (isReceipt() && !state.items.length) return toast("Escanee al menos un saco o bulto.", "error");
+    if (isInverse()) {
+      if (!state.sacks.length || !state.packages.length) return toast("Registre costales y paquetes.", "error");
+      if (state.sacks.some((item) => item.estado === "ABIERTO")) return toast("Cierre todos los costales.", "error");
+    }
+    const completionNotice = requiresTransportGuide() ? " Después ya no podrá editar la guía de remisión." : "";
+    if (!confirm(`¿Confirmar la descarga y completar la operación?${completionNotice}`)) return;
+
+    showLoading("Subiendo evidencias…");
+    try {
+      if (requiresTransportGuide()) {
+        await syncOperationMetadata();
+        await syncTransportGuide();
+      }
+      if (isTruckReceipt()) await syncTruckReceipt();
+      else await syncGeneralEvidence();
+      await syncEmptySackEvidence();
+
+      showLoading("Finalizando operación…");
+      const { data, error } = await db.rpc("finalizar_operacion", {
+        p_operacion_id: state.operation.id,
+        p_latitud: state.gps.latitude,
+        p_longitud: state.gps.longitude,
+        p_precision: state.gps.accuracy,
+        p_dni_ruc: $("#responsibleDocument").value.trim() || null,
+        p_observaciones: $("#operationNotes").value.trim() || null,
+        p_datos_extra: {},
+      });
+      if (error) throw error;
+      const finishedCode = state.operation.codigo;
+      localStorage.removeItem("controlLogisticoDraft");
+      resetOperationState();
+      $("#operationWorkspace").classList.add("hidden");
+      $("#operationPicker").classList.remove("hidden");
+      $("#newPanelTitle").textContent = "Selecciona una operación";
+      toast(`OT ${finishedCode} completada.`, "success");
+      await Promise.all([loadHome(), loadRecent(), loadRecords()]);
+      switchView("records");
+      return data;
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    } finally {
+      hideLoading();
+    }
+  }
+
+  async function deleteOperation(id) {
+    if (state.profile?.rol !== "ADMINISTRADOR") return toast("Solo el Administrador puede eliminar borradores.", "error");
+    const confirmed = confirm("¿Eliminar definitivamente esta operación? Se borrarán sus escaneos, costales, paquetes y evidencias.");
+    if (!confirmed) return;
+    showLoading("Eliminando borrador…");
+    try {
+      const [operationResult, evidencesResult] = await Promise.all([
+        db.from("operaciones").select("id,ot,codigo,estado").eq("id", id).single(),
+        db.from("evidencias").select("id,drive_file_id").eq("operacion_id", id),
+      ]);
+      if (operationResult.error) throw operationResult.error;
+      if (evidencesResult.error) throw evidencesResult.error;
+      if (!["PENDIENTE", "EN_PROCESO"].includes(operationResult.data.estado)) {
+        throw new Error("Solo se pueden eliminar operaciones pendientes o en proceso.");
+      }
+
+      for (const evidence of evidencesResult.data || []) {
+        await callDrive("ELIMINAR_EVIDENCIA", { fileId: evidence.drive_file_id });
+      }
+
+      const { error } = await db.from("operaciones").delete().eq("id", id);
+      if (error) throw error;
+      if (state.operation?.id === id) {
+        localStorage.removeItem("controlLogisticoDraft");
+        resetOperationState();
+        $("#operationWorkspace").classList.add("hidden");
+        $("#operationSetup").classList.add("hidden");
+        $("#operationPicker").classList.remove("hidden");
+        $("#newPanelTitle").textContent = "Selecciona una operación";
+      }
+      $("#recordDialog")?.close();
+      toast(`OT ${operationResult.data.ot || operationResult.data.codigo} eliminada.`, "success");
+      await Promise.all([loadHome(), loadRecent(), loadRecords()]);
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    } finally {
+      hideLoading();
+    }
+  }
+
+  let scannerLibraryPromise = null;
+
+  function getZXingBrowser() {
+    // @zxing/browser publica el UMD como ZXingBrowser. Se conserva ZXing
+    // como respaldo para instalaciones antiguas que todavía lo exponen así.
+    return window.ZXingBrowser || window.ZXing || null;
+  }
+
+  function loadScannerLibrary() {
+    const loaded = getZXingBrowser();
+    if (loaded?.BrowserMultiFormatReader) return Promise.resolve(loaded);
+    if (scannerLibraryPromise) return scannerLibraryPromise;
+
+    scannerLibraryPromise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = "https://cdn.jsdelivr.net/npm/@zxing/browser@0.2.1/umd/zxing-browser.min.js";
+      script.async = true;
+      script.dataset.zxingFallback = "true";
+      script.onload = () => {
+        const zxing = getZXingBrowser();
+        if (zxing?.BrowserMultiFormatReader) resolve(zxing);
+        else reject(new Error("La biblioteca de cámara no expuso el lector.") );
+      };
+      script.onerror = () => reject(new Error("No se pudo descargar la biblioteca del lector."));
+      document.head.appendChild(script);
+    });
+
+    return scannerLibraryPromise;
+  }
+
+  async function listVideoInputDevices(zxing) {
+    const browserReader = zxing?.BrowserCodeReader;
+    if (browserReader && typeof browserReader.listVideoInputDevices === "function") {
+      return browserReader.listVideoInputDevices();
+    }
+
+    // Respaldo para navegadores/paquetes que no incluyen el método estático.
+    if (!navigator.mediaDevices?.enumerateDevices) {
+      throw new Error("El navegador no permite enumerar las cámaras.");
+    }
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return devices.filter((device) => device.kind === "videoinput");
+  }
+
+  async function startScanner(mode, inputId = "", label = "Código") {
+    let zxing = getZXingBrowser();
+    if (!zxing?.BrowserMultiFormatReader) {
+      try {
+        zxing = await loadScannerLibrary();
+      } catch (error) {
+        return toast(`${errorMessage(error)} Use el ingreso manual.`, "error");
+      }
+    }
+    stopScanner(false);
+    state.scanner.mode = mode;
+    state.scanner.inputId = inputId;
+    state.scanner.active = true;
+    state.scanner.locked = false;
+    $("#scannerTitle").textContent = `Escanear ${label}`;
+    $("#scannerStatus").className = "scanner-status";
+    $("#scannerStatus").textContent = "Solicitando acceso a la cámara…";
+    $("#scannerModal").classList.remove("hidden");
+
+    try {
+      const reader = new zxing.BrowserMultiFormatReader();
+      state.scanner.reader = reader;
+      state.scanner.devices = await listVideoInputDevices(zxing);
+      if (!state.scanner.devices.length) throw new Error("No se detectó una cámara.");
+      const preferred = state.scanner.devices.findIndex((device) => /back|rear|environment|trasera/i.test(device.label));
+      state.scanner.deviceIndex = preferred >= 0 ? preferred : state.scanner.devices.length - 1;
+      await decodeWithCurrentCamera();
+    } catch (error) {
+      $("#scannerStatus").className = "scanner-status error";
+      $("#scannerStatus").textContent = `${errorMessage(error)} Puede usar el ingreso manual.`;
+    }
+  }
+
+  async function decodeWithCurrentCamera() {
+    const { reader, devices, deviceIndex } = state.scanner;
+    if (!reader || !devices.length) return;
+    const deviceId = devices[deviceIndex]?.deviceId;
+    $("#scannerStatus").textContent = "Apunte al código de barras o QR.";
+    await reader.decodeFromVideoDevice(deviceId, "scannerVideo", async (result) => {
+      if (!state.scanner.active || !result) return;
+      await processScannedCode(result.getText ? result.getText() : result.text);
+    });
+  }
+
+  async function processScannedCode(raw) {
+    const code = normalizeCode(raw);
+    const now = Date.now();
+    if (!code || state.scanner.locked) return;
+    if (state.scanner.lastCode === code && now - state.scanner.lastAt < 2200) return;
+    state.scanner.lastCode = code;
+    state.scanner.lastAt = now;
+    state.scanner.locked = true;
+
+    let ok = false;
+    if (state.scanner.mode === "INPUT") {
+      const input = document.getElementById(state.scanner.inputId);
+      if (input) { input.value = code; ok = true; }
+    } else if (state.scanner.mode === "RECEIPT_ITEM") ok = await addReceiptCode(code);
+    else if (state.scanner.mode === "SACK") ok = await openSack(code);
+    else if (state.scanner.mode === "PACKAGE") ok = await addPackage(code);
+    else if (state.scanner.mode === "EMPTY_SACK") ok = await addEmptySackCode(code);
+
+    const status = $("#scannerStatus");
+    status.className = `scanner-status ${ok ? "ok" : "error"}`;
+    status.textContent = ok ? `Leído: ${code}` : `No se registró: ${code}`;
+    if (ok) vibrate(90);
+
+    if (state.scanner.mode === "INPUT" || state.scanner.mode === "SACK") {
+      setTimeout(() => stopScanner(), 450);
+    } else {
+      setTimeout(() => {
+        state.scanner.locked = false;
+        if (state.scanner.active) {
+          status.className = "scanner-status";
+          status.textContent = "Apunte al siguiente código.";
+        }
+      }, 650);
+    }
+  }
+
+  function stopScanner(hide = true) {
+    state.scanner.active = false;
+    state.scanner.locked = false;
+    try { state.scanner.reader?.reset(); } catch (error) { console.debug(error); }
+    const video = $("#scannerVideo");
+    if (video?.srcObject) {
+      video.srcObject.getTracks().forEach((track) => track.stop());
+      video.srcObject = null;
+    }
+    state.scanner.reader = null;
+    if (hide) $("#scannerModal").classList.add("hidden");
+  }
+
+  async function changeCamera() {
+    if (state.scanner.devices.length < 2) return toast("No se detectó otra cámara.");
+    try {
+      const zxing = getZXingBrowser();
+      if (!zxing?.BrowserMultiFormatReader) throw new Error("El lector no pudo cargarse. Use el ingreso manual.");
+      state.scanner.reader?.reset();
+      state.scanner.deviceIndex = (state.scanner.deviceIndex + 1) % state.scanner.devices.length;
+      state.scanner.reader = new zxing.BrowserMultiFormatReader();
+      await decodeWithCurrentCamera();
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    }
+  }
+
+  function vibrate(pattern) {
+    if (navigator.vibrate) navigator.vibrate(pattern);
+  }
+
+  async function loadHome() {
+    if (!state.profile) return;
+    const today = todayInput();
+    // Lima permanece en UTC-5. Usamos un límite exclusivo para no perder
+    // registros creados cerca de medianoche.
+    const start = new Date(`${today}T00:00:00-05:00`);
+    const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+    const count = (status) => {
+      let query = db.from("operaciones").select("id", { count: "exact", head: true });
+      if (status) query = query.eq("estado", status);
+      return query;
+    };
+
+    const [todayResult, pendingResult, processResult, doneResult] = await Promise.all([
+      count().gte("created_at", start.toISOString()).lt("created_at", end.toISOString()),
+      count("PENDIENTE"),
+      count("EN_PROCESO"),
+      count("COMPLETADO"),
+    ]);
+    const failed = [todayResult, pendingResult, processResult, doneResult].find((result) => result.error);
+    if (failed) {
+      console.error("No se pudo cargar el resumen:", failed.error);
+      toast(`No se pudo cargar el resumen: ${failed.error.message}`, "error");
+      return;
+    }
+    $("#sumToday").textContent = todayResult.count ?? 0;
+    $("#sumPending").textContent = pendingResult.count ?? 0;
+    $("#sumProcess").textContent = processResult.count ?? 0;
+    $("#sumDone").textContent = doneResult.count ?? 0;
+  }
+
+  async function loadRecent() {
+    if (!state.profile) return;
+    const { data, error } = await db.from("v_resumen_operaciones").select("*").order("created_at", { ascending: false }).limit(5);
+    if (error) return console.error(error);
+    renderRecordList(data || [], $("#recentList"));
+  }
+
+  async function loadRecords() {
+    if (!state.profile) return;
+    const type = $("#filterType").value;
+    const status = $("#filterStatus").value;
+    const from = $("#filterFrom").value;
+    const to = $("#filterTo").value;
+    let query = db.from("v_resumen_operaciones").select("*").order("created_at", { ascending: false }).limit(300);
+    if (type) query = query.eq("tipo", type);
+    if (status) query = query.eq("estado", status);
+    if (from) query = query.gte("created_at", `${from}T00:00:00`);
+    if (to) query = query.lte("created_at", `${to}T23:59:59`);
+    showLoading("Consultando registros…");
+    try {
+      const { data, error } = await query;
+      if (error) throw error;
+      const rows = data || [];
+      renderRecordList(rows, $("#recordsList"));
+      $("#recordsSummary").innerHTML = `
+        <article class="summary-card warning"><span>Pendientes</span><strong>${rows.filter((row) => row.estado === "PENDIENTE").length}</strong></article>
+        <article class="summary-card process"><span>En proceso</span><strong>${rows.filter((row) => row.estado === "EN_PROCESO").length}</strong></article>
+        <article class="summary-card success"><span>Completados</span><strong>${rows.filter((row) => row.estado === "COMPLETADO").length}</strong></article>`;
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    } finally {
+      hideLoading();
+    }
+  }
+
+  function setDevolucionMessage(message, ok = false) {
+    const node = $("#devolucionOtStatus");
+    if (!node) return;
+    node.textContent = message;
+    node.className = `form-message ${ok ? "success" : "error"}`;
+  }
+
+  function renderDevolucionPhoto() {
+    const preview = $("#devolucionPhotoPreview");
+    if (!preview) return;
+    const draft = state.devolucion.photoDraft;
+    const evidence = state.devolucion.evidence;
+    if (draft?.dataUrl) {
+      preview.innerHTML = `<img src="${draft.dataUrl}" alt="Foto de recepción de devolución">`;
+    } else if (evidence) {
+      preview.textContent = `Fotografía guardada en Drive${evidence.nombre_archivo ? ` · ${evidence.nombre_archivo}` : ""}`;
+    } else {
+      preview.textContent = "Sin fotografía";
+    }
+  }
+
+  function setDevolucionQuantity(id, value) {
+    const node = $(id);
+    if (node) node.value = Number.isInteger(Number(value)) ? Number(value) : 0;
+  }
+
+  function populateDevolucionForm(reception) {
+    const row = reception || {};
+    $("#devolucionFecha").value = localDateTimeValue(row.fecha_ejecucion);
+    setDevolucionQuantity("#devolucionPaquetesConCodigo", row.cantidad_paquetes_con_codigo);
+    setDevolucionQuantity("#devolucionPaquetesSinCodigo", row.cantidad_paquetes_sin_codigo);
+    setDevolucionQuantity("#devolucionCostalesConCodigo", row.cantidad_costales_con_codigo);
+    setDevolucionQuantity("#devolucionCostalesSinCodigo", row.cantidad_costales_sin_codigo);
+    $("#devolucionObsPaquetesConCodigo").value = row.observacion_paquetes_con_codigo || "";
+    $("#devolucionObsPaquetesSinCodigo").value = row.observacion_paquetes_sin_codigo || "";
+    $("#devolucionObsCostalesConCodigo").value = row.observacion_costales_con_codigo || "";
+    $("#devolucionObsCostalesSinCodigo").value = row.observacion_costales_sin_codigo || "";
+    $("#devolucionObservaciones").value = row.observaciones || "";
+    renderDevolucionPhoto();
+  }
+
+  async function handleDevolucionPhoto(input) {
+    const file = input.files?.[0];
+    if (!file) return;
+    if (file.size > 6 * 1024 * 1024) {
+      toast("La foto no puede superar 6 MB.", "error");
+      input.value = "";
+      return;
+    }
+    showLoading("Procesando fotografía…");
+    try {
+      state.devolucion.photoDraft = {
+        dataUrl: await processImage(file),
+        fileName: file.name,
+        mimeType: "image/jpeg",
+      };
+      renderDevolucionPhoto();
+    } catch (error) {
+      toast(errorMessage(error), "error");
+      input.value = "";
+    } finally {
+      hideLoading();
+    }
+  }
+
+  async function findDevolucionOperation(ot) {
+    const { data, error } = await db.from("operaciones")
+      .select("id,codigo,ot,tipo,estado,estado_recepcion_devolucion,pdv_id,pdvs:pdv_id(codigo,nombre)")
+      .eq("ot", ot)
+      .in("tipo", ["INVERSA_CAMION", "INVERSA_ENCOMIENDA", "INVERSA_RECOJO_ALMACEN"])
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    return data;
+  }
+
+  async function loadDevolucionOt(silent = false) {
+    if (!["ADMINISTRADOR", "ENCARGADO"].includes(state.profile?.rol)) return toast("Este módulo está disponible para Administrador y Encargado.", "error");
+    const ot = normalizeCode($("#devolucionOt").value);
+    $("#devolucionOt").value = ot;
+    if (!ot) return setDevolucionMessage("Ingrese o escanee una OT.");
+    if (!silent) showLoading("Consultando OT de devolución…");
+    try {
+      const operation = await findDevolucionOperation(ot);
+      if (!operation) throw new Error("No se encontró una logística inversa con esa OT.");
+      const receptionResult = await db.from("recepciones_devoluciones")
+        .select("*")
+        .eq("operacion_inversa_id", operation.id)
+        .maybeSingle();
+      if (receptionResult.error) throw receptionResult.error;
+      let evidence = null;
+      if (receptionResult.data) {
+        const evidenceResult = await db.from("evidencias_recepciones_devoluciones")
+          .select("*")
+          .eq("recepcion_devolucion_id", receptionResult.data.id)
+          .maybeSingle();
+        if (evidenceResult.error) throw evidenceResult.error;
+        evidence = evidenceResult.data;
+      }
+      state.devolucion = { inverseOperation: operation, reception: receptionResult.data, evidence, photoDraft: null };
+      populateDevolucionForm(receptionResult.data);
+      const pdv = operation.pdvs ? ` · PDV ${operation.pdvs.codigo}` : "";
+      setDevolucionMessage(
+        receptionResult.data
+          ? `Recepción ya registrada para ${ot}${pdv}. Puede actualizar cantidades, observaciones o reemplazar la foto.`
+          : `OT encontrada: ${TYPE_LABELS[operation.tipo]}${pdv}. La recepción quedará pendiente hasta guardar.`,
+        true,
+      );
+      return operation;
+    } catch (error) {
+      state.devolucion.inverseOperation = null;
+      state.devolucion.reception = null;
+      state.devolucion.evidence = null;
+      setDevolucionMessage(errorMessage(error));
+      throw error;
+    } finally {
+      if (!silent) hideLoading();
+    }
+  }
+
+  function nonNegativeInteger(value, label) {
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < 0) throw new Error(`${label} debe ser un número entero igual o mayor que cero.`);
+    return parsed;
+  }
+
+  async function saveDevolucion(event) {
+    event.preventDefault();
+    if (!["ADMINISTRADOR", "ENCARGADO"].includes(state.profile?.rol)) return toast("Este módulo está disponible para Administrador y Encargado.", "error");
+    showLoading("Guardando recepción de devolución…");
+    try {
+      if (!state.devolucion.inverseOperation) await loadDevolucionOt(true);
+      const operation = state.devolucion.inverseOperation;
+      if (!operation) throw new Error("Consulte primero una OT de logística inversa.");
+      const fecha = new Date($("#devolucionFecha").value);
+      if (Number.isNaN(fecha.getTime())) throw new Error("Ingrese una fecha y hora válidas.");
+      if (!state.devolucion.photoDraft && !state.devolucion.evidence) {
+        throw new Error("Debe adjuntar la foto de la recepción.");
+      }
+
+      const payload = {
+        ot_devolucion: operation.ot,
+        operacion_inversa_id: operation.id,
+        fecha_ejecucion: fecha.toISOString(),
+        cantidad_paquetes_con_codigo: nonNegativeInteger($("#devolucionPaquetesConCodigo").value, "Paquetes con código"),
+        observacion_paquetes_con_codigo: $("#devolucionObsPaquetesConCodigo").value.trim() || null,
+        cantidad_paquetes_sin_codigo: nonNegativeInteger($("#devolucionPaquetesSinCodigo").value, "Paquetes sin código"),
+        observacion_paquetes_sin_codigo: $("#devolucionObsPaquetesSinCodigo").value.trim() || null,
+        cantidad_costales_con_codigo: nonNegativeInteger($("#devolucionCostalesConCodigo").value, "Costales con código"),
+        observacion_costales_con_codigo: $("#devolucionObsCostalesConCodigo").value.trim() || null,
+        cantidad_costales_sin_codigo: nonNegativeInteger($("#devolucionCostalesSinCodigo").value, "Costales sin código"),
+        observacion_costales_sin_codigo: $("#devolucionObsCostalesSinCodigo").value.trim() || null,
+        observaciones: $("#devolucionObservaciones").value.trim() || null,
+        estado: "RECEPCIONADO",
+      };
+
+      let receptionResult;
+      if (state.devolucion.reception) {
+        receptionResult = await db.from("recepciones_devoluciones")
+          .update(payload)
+          .eq("id", state.devolucion.reception.id)
+          .select("*")
+          .single();
+      } else {
+        receptionResult = await db.from("recepciones_devoluciones")
+          .insert({ ...payload, registrado_por: state.profile.id })
+          .select("*")
+          .single();
+      }
+      if (receptionResult.error) throw receptionResult.error;
+
+      let evidence = state.devolucion.evidence;
+      if (state.devolucion.photoDraft) {
+        if (evidence) {
+          await callDrive("ELIMINAR_EVIDENCIA", { fileId: evidence.drive_file_id });
+          const { error } = await db.from("evidencias_recepciones_devoluciones").delete().eq("id", evidence.id);
+          if (error) throw error;
+        }
+        const driveResult = await callDrive("SUBIR_EVIDENCIA", {
+          codigoOperacion: operation.ot,
+          categoria: "RECEPCION_DEVOLUCION",
+          referenciaCodigo: operation.ot,
+          dataUrl: state.devolucion.photoDraft.dataUrl,
+          nombreArchivo: state.devolucion.photoDraft.fileName,
+        });
+        const evidenceResult = await db.from("evidencias_recepciones_devoluciones").insert({
+          recepcion_devolucion_id: receptionResult.data.id,
+          drive_file_id: driveResult.fileId,
+          nombre_archivo: driveResult.nombre,
+          mime_type: driveResult.mimeType,
+          registrado_por: state.profile.id,
+        }).select("*").single();
+        if (evidenceResult.error) throw evidenceResult.error;
+        evidence = evidenceResult.data;
+      }
+
+      state.devolucion.reception = receptionResult.data;
+      state.devolucion.evidence = evidence;
+      state.devolucion.photoDraft = null;
+      $("#devolucionPhotoInput").value = "";
+      renderDevolucionPhoto();
+      setDevolucionMessage(`Recepción de la OT ${operation.ot} guardada y marcada como recepcionada.`, true);
+      toast("Recepción de devolución guardada.", "success");
+      await Promise.all([loadDevoluciones(), loadRecords(), loadRecent()]);
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    } finally {
+      hideLoading();
+    }
+  }
+
+  async function loadDevoluciones() {
+    if (!["ADMINISTRADOR", "ENCARGADO"].includes(state.profile?.rol)) return;
+    showLoading("Cargando recepciones de devoluciones…");
+    try {
+      const { data, error } = await db.from("v_recepciones_devoluciones")
+        .select("*")
+        .order("fecha_ejecucion", { ascending: false })
+        .limit(200);
+      if (error) throw error;
+      renderDevoluciones(data || []);
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    } finally {
+      hideLoading();
+    }
+  }
+
+  function renderDevoluciones(rows) {
+    const target = $("#devolucionesList");
+    if (!target) return;
+    target.innerHTML = rows.length ? rows.map((row) => {
+      const totalPaquetes = Number(row.cantidad_paquetes_con_codigo || 0) + Number(row.cantidad_paquetes_sin_codigo || 0);
+      const totalCostales = Number(row.cantidad_costales_con_codigo || 0) + Number(row.cantidad_costales_sin_codigo || 0);
+      return `<article class="record-card" data-devolucion-ot="${escapeHtml(row.ot_devolucion)}">
+        <div class="record-main"><small>${formatDate(row.fecha_ejecucion)} · ${escapeHtml(row.pdv_codigo || "")}</small><strong>OT ${escapeHtml(row.ot_devolucion)}</strong><small class="record-document">${escapeHtml(row.pdv_nombre || "PDV no disponible")}</small><div class="record-meta"><span class="record-tag">Paquetes: ${totalPaquetes}</span><span class="record-tag">Costales: ${totalCostales}</span></div></div>
+        <div class="record-side"><span class="status-pill ${row.estado === "RECEPCIONADO" ? "done" : "cancelled"}">${escapeHtml(row.estado === "RECEPCIONADO" ? "Recepcionado" : "Anulado")}</span><small>${row.drive_file_id ? "Foto adjunta" : "Sin foto"}</small></div>
+      </article>`;
+    }).join("") : '<div class="empty-state">No hay recepciones registradas.</div>';
+  }
+
+  function renderRecordList(rows, target) {
+    const receptionBadge = (row) => INVERSE_TYPES.has(row.tipo)
+      ? `<span class="record-tag reception-state ${row.estado_recepcion_devolucion === "RECEPCIONADO" ? "done" : "pending"}">Recepción devolución: ${row.estado_recepcion_devolucion === "RECEPCIONADO" ? "Recepcionado" : "Pendiente"}</span>`
+      : "";
+    target.innerHTML = rows.length ? rows.map((row) => `
+      <article class="record-card" data-record-id="${row.id}">
+        <div class="record-main"><small>${formatDate(row.created_at)} · ${escapeHtml(row.pdv_codigo || "")}</small><strong>${escapeHtml(row.ot || row.codigo)}</strong><small class="record-document">${escapeHtml(NO_TRANSPORT_GUIDE_TYPES.has(row.tipo) ? "Sin guía de remisión" : (row.guia_remision_nombre || row.guia_remision_transporte || "Guía de remisión pendiente"))}</small><div class="record-meta"><span class="record-tag">${escapeHtml(TYPE_LABELS[row.tipo] || row.tipo)}</span>${receptionBadge(row)}</div></div>
+        <div class="record-side"><span class="status-pill ${statusClass(row.estado)}">${escapeHtml(statusLabel(row.estado))}</span><small>${row.total_costales ? "Paquetes" : "Recibidos"}</small><strong>${row.total_costales ? Number(row.total_paquetes || 0) : Number(row.total_recibidos || 0)}</strong></div>
+      </article>`).join("") : '<div class="empty-state">No se encontraron registros.</div>';
+  }
+
+  function renderAdminEditor(operation, items, sacks, packages, seals, emptySacks) {
+    if (state.profile?.rol !== "ADMINISTRADOR") return "";
+    const field = (label, key, value, extra = "") => `<div class="field"><label>${label}</label><input data-admin-operation-field="${key}" value="${escapeHtml(value || "")}" ${extra}></div>`;
+    const itemEditor = items.length ? `<div class="admin-edit-list">${items.map((item) => `<div class="admin-edit-row"><small>${escapeHtml(item.tipo.replaceAll("_", " "))} · ${formatDate(item.escaneado_at)}</small><input data-admin-item-code="${item.id}" value="${escapeHtml(item.codigo)}" placeholder="Código"><select data-admin-item-type="${item.id}"><option value="SACO" ${item.tipo === "SACO" ? "selected" : ""}>Saco</option><option value="BULTO_SUELTO" ${item.tipo === "BULTO_SUELTO" ? "selected" : ""}>Bulto suelto</option></select></div>`).join("")}</div>` : '<div class="empty-state">No hay sacos o bultos registrados.</div>';
+    const sackEditor = `<div id="adminSackEditorList" class="admin-edit-list">${sacks.length ? sacks.map((sack) => `<div class="admin-edit-row"><small>Costal ${Number(sack.orden) || ""} · ${escapeHtml(sack.estado)} · ${sack.codigo ? escapeHtml(sack.codigo) : "Sin código"}</small><input data-admin-sack-code="${sack.id}" value="${escapeHtml(sack.codigo || "")}" placeholder="Código (opcional; vacío = sin código)"></div>`).join("") : '<div class="empty-state">No hay costales registrados.</div>'}</div><button type="button" class="button secondary full" data-action="add-admin-sack">Agregar costal</button>`;
+    const packageEditor = packages.length ? `<div class="admin-edit-list">${packages.map((item) => { const sack = sacks.find((candidate) => candidate.id === item.costal_id); return `<div class="admin-edit-row"><small>Costal: ${escapeHtml(sack?.codigo || "Sin código")}</small><input data-admin-package-code="${item.id}" data-admin-package-original="${escapeHtml(item.codigo)}" value="${escapeHtml(item.codigo)}" placeholder="Código JPE..."></div>`; }).join("")}</div>` : '<div class="empty-state">No hay paquetes registrados.</div>';
+    const emptyEditor = emptySacks.length ? `<div class="admin-edit-list">${emptySacks.map((item) => `<div class="admin-edit-row admin-empty-row"><select data-admin-empty-type="${item.id}"><option value="CON_CODIGO" ${item.tipo === "CON_CODIGO" ? "selected" : ""}>Con código</option><option value="SIN_CODIGO" ${item.tipo === "SIN_CODIGO" ? "selected" : ""}>Sin código</option></select><input data-admin-empty-code="${item.id}" value="${escapeHtml(item.codigo || "")}" placeholder="Código"><input data-admin-empty-quantity="${item.id}" type="number" min="1" value="${Number(item.cantidad || 1)}"><input data-admin-empty-observation="${item.id}" value="${escapeHtml(item.observacion || "")}" placeholder="Observación"></div>`).join("")}</div>` : '<div class="empty-state">No hay sacos vacíos registrados.</div>';
+    const sealEditor = seals.length ? `<div class="admin-edit-list">${seals.map((seal) => `<div class="admin-edit-row"><small>Precinto ${escapeHtml(seal.etapa)} ${Number(seal.numero)}</small><input data-admin-seal-code="${seal.id}" value="${escapeHtml(seal.codigo)}" placeholder="Código del precinto"></div>`).join("")}</div>` : '<div class="empty-state">No hay precintos registrados.</div>';
+    return `<section class="detail-section admin-edit-section">
+      <div class="admin-edit-title"><div><h3>Editar información registrada</h3><small>Disponible únicamente para Administrador. Las correcciones quedan auditadas.</small></div><span class="status-pill process">ADMIN</span></div>
+      <div class="field-grid">
+        ${field("OT / ID", "ot", operation.ot || operation.codigo, "required autocapitalize=\"characters\"")}
+        ${NO_TRANSPORT_GUIDE_TYPES.has(operation.tipo) ? "" : field("N.° guía de remisión", "guia_remision_transporte", operation.guia_remision_transporte)}
+        ${field("ID de ruta", "id_ruta", operation.id_ruta)}
+        ${field("Placa", "placa", operation.placa)}
+        ${field("Empresa de encomienda", "empresa_encomienda", operation.empresa_encomienda)}
+        ${field("N.° de encomienda", "numero_encomienda", operation.numero_encomienda)}
+        ${field("DNI/RUC responsable", "dni_ruc_responsable", operation.dni_ruc_responsable)}
+      </div>
+      <div class="field"><label>Observaciones</label><textarea data-admin-operation-field="observaciones" rows="3">${escapeHtml(operation.observaciones || "")}</textarea></div>
+      <h4 class="admin-edit-subtitle">Sacos y bultos recibidos</h4>${itemEditor}
+      ${INVERSE_TYPES.has(operation.tipo) ? `<h4 class="admin-edit-subtitle">Costales <small>(código opcional; vacío = sin código)</small></h4>${sackEditor}` : ""}
+      <h4 class="admin-edit-subtitle">Paquetes <small>(deben comenzar con JPE)</small></h4>${packageEditor}
+      <h4 class="admin-edit-subtitle">Sacos vacíos retornados</h4>${emptyEditor}
+      <h4 class="admin-edit-subtitle">Precintos</h4>${sealEditor}
+      <button type="button" class="button primary full" data-action="save-admin-record" data-admin-operation-id="${operation.id}">Guardar correcciones y registrar auditoría</button>
+    </section>`;
+  }
+
+  function addAdminSackRow() {
+    const list = $("#adminSackEditorList");
+    if (!list) return;
+    list.querySelector(".empty-state")?.remove();
+    const row = document.createElement("div");
+    row.className = "admin-edit-row";
+    row.innerHTML = '<small>Nuevo costal · código opcional</small><input data-admin-new-sack-code placeholder="Código (opcional; vacío = sin código)" autocapitalize="characters">';
+    list.appendChild(row);
+    row.querySelector("input")?.focus();
+  }
+
+  async function saveAdminRecord(operationId) {
+    if (state.profile?.rol !== "ADMINISTRADOR") return toast("Solo el Administrador puede modificar registros.", "error");
+    const operationField = (key) => $(`[data-admin-operation-field="${key}"]`);
+    const ot = normalizeCode(operationField("ot")?.value);
+    if (!ot) return toast("La OT no puede quedar vacía.", "error");
+
+    const packageUpdates = $$('[data-admin-package-code]').map((input) => ({ id: input.dataset.adminPackageCode, codigo: normalizeCode(input.value), original: normalizeCode(input.dataset.adminPackageOriginal) }));
+    const invalidPackage = packageUpdates.find((item) => item.codigo !== item.original && !item.codigo.startsWith("JPE"));
+    if (invalidPackage) return toast("Todos los códigos de paquetes deben comenzar con JPE.", "error");
+    const itemUpdates = $$('[data-admin-item-code]').map((input) => ({ id: input.dataset.adminItemCode, codigo: normalizeCode(input.value), tipo: $(`[data-admin-item-type="${input.dataset.adminItemCode}"]`).value }));
+    if (itemUpdates.some((item) => !item.codigo)) return toast("Los códigos de sacos o bultos no pueden quedar vacíos.", "error");
+    const sackUpdates = $$('[data-admin-sack-code]').map((input) => ({ id: input.dataset.adminSackCode, codigo: normalizeCode(input.value) || null }));
+    const newSackUpdates = $$('[data-admin-new-sack-code]').map((input) => ({ codigo: normalizeCode(input.value) || null }));
+    const sealUpdates = $$('[data-admin-seal-code]').map((input) => ({ id: input.dataset.adminSealCode, codigo: normalizeCode(input.value) }));
+    if (sealUpdates.some((item) => !item.codigo)) return toast("Los códigos de precintos no pueden quedar vacíos.", "error");
+
+    const emptyUpdates = $$('[data-admin-empty-type]').map((select) => {
+      const id = select.dataset.adminEmptyType;
+      const type = select.value;
+      const code = normalizeCode($(`[data-admin-empty-code="${id}"]`)?.value);
+      const quantity = Number.parseInt($(`[data-admin-empty-quantity="${id}"]`)?.value, 10);
+      const observation = $(`[data-admin-empty-observation="${id}"]`)?.value.trim() || null;
+      return { id, tipo: type, codigo: type === "CON_CODIGO" ? code : null, cantidad: type === "CON_CODIGO" ? 1 : quantity, observacion: observation };
+    });
+    const invalidEmpty = emptyUpdates.find((item) => (item.tipo === "CON_CODIGO" && (!item.codigo || item.cantidad !== 1)) || (item.tipo === "SIN_CODIGO" && (!Number.isInteger(item.cantidad) || item.cantidad < 1)));
+    if (invalidEmpty) return toast("Revise los datos de los sacos vacíos.", "error");
+
+    showLoading("Guardando correcciones…");
+    try {
+      const operationPayload = {
+        ot,
+        guia_remision_transporte: normalizeCode(operationField("guia_remision_transporte")?.value) || null,
+        id_ruta: normalizeCode(operationField("id_ruta")?.value) || null,
+        placa: normalizeCode(operationField("placa")?.value) || null,
+        empresa_encomienda: operationField("empresa_encomienda")?.value.trim() || null,
+        numero_encomienda: normalizeCode(operationField("numero_encomienda")?.value) || null,
+        dni_ruc_responsable: operationField("dni_ruc_responsable")?.value.trim() || null,
+        observaciones: operationField("observaciones")?.value.trim() || null,
+      };
+      let result = await db.from("operaciones").update(operationPayload).eq("id", operationId).select("id").single();
+      if (result.error) throw result.error;
+
+      for (const item of itemUpdates) {
+        const id = item.id;
+        result = await db.from("items_recepcion").update({
+          codigo: item.codigo,
+          tipo: item.tipo,
+        }).eq("id", id).eq("operacion_id", operationId);
+        if (result.error) throw result.error;
+      }
+      for (const item of sackUpdates) {
+        result = await db.from("costales").update({ codigo: item.codigo }).eq("id", item.id).eq("operacion_id", operationId);
+        if (result.error) throw result.error;
+      }
+      if (newSackUpdates.length) {
+        const orderResult = await db.from("costales").select("orden").eq("operacion_id", operationId).order("orden", { ascending: false }).limit(1).maybeSingle();
+        if (orderResult.error) throw orderResult.error;
+        let nextOrder = Number(orderResult.data?.orden || 0) + 1;
+        for (const item of newSackUpdates) {
+          result = await db.from("costales").insert({
+            operacion_id: operationId,
+            codigo: item.codigo,
+            orden: nextOrder++,
+            estado: "CERRADO",
+            creado_por: state.profile.id,
+          }).select("id").single();
+          if (result.error) throw result.error;
+        }
+      }
+      for (const item of packageUpdates.filter((candidate) => candidate.codigo !== candidate.original)) {
+        result = await db.from("paquetes").update({ codigo: item.codigo }).eq("id", item.id).eq("operacion_id", operationId);
+        if (result.error) throw result.error;
+      }
+      for (const item of emptyUpdates) {
+        result = await db.from("sacos_vacios").update({ tipo: item.tipo, codigo: item.codigo, cantidad: item.cantidad, observacion: item.observacion }).eq("id", item.id).eq("operacion_id", operationId);
+        if (result.error) throw result.error;
+      }
+      for (const item of sealUpdates) {
+        result = await db.from("precintos").update({ codigo: item.codigo }).eq("id", item.id).eq("operacion_id", operationId);
+        if (result.error) throw result.error;
+      }
+      toast("Correcciones guardadas y auditadas.", "success");
+      await openRecord(operationId);
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    } finally {
+      hideLoading();
+    }
+  }
+
+  async function openRecord(id) {
+    showLoading("Cargando detalle…");
+    try {
+      const [operationResult, itemsResult, sacksResult, packagesResult, sealsResult, evidencesResult, emptySacksResult, auditResult] = await Promise.all([
+        db.from("operaciones").select("*,pdvs:pdv_id(codigo,nombre)").eq("id", id).single(),
+        db.from("items_recepcion").select("*").eq("operacion_id", id).order("orden"),
+        db.from("costales").select("*").eq("operacion_id", id).order("orden"),
+        db.from("paquetes").select("*").eq("operacion_id", id).order("orden"),
+        db.from("precintos").select("*").eq("operacion_id", id).order("etapa").order("numero"),
+        db.from("evidencias").select("*").eq("operacion_id", id).order("created_at"),
+        db.from("sacos_vacios").select("*").eq("operacion_id", id).order("created_at"),
+        db.from("v_auditoria_cambios").select("*").eq("operacion_id", id).order("created_at", { ascending: false }).limit(200),
+      ]);
+      for (const result of [operationResult, itemsResult, sacksResult, packagesResult, sealsResult, evidencesResult, emptySacksResult, auditResult]) if (result.error) throw result.error;
+      const o = operationResult.data;
+      $("#recordDialogTitle").textContent = o.codigo;
+      const details = [
+        ["Operación", TYPE_LABELS[o.tipo] || o.tipo], ["Estado", statusLabel(o.estado)], ["PDV", `${o.pdvs?.codigo || ""} ${o.pdvs?.nombre || ""}`], ["Inicio", formatDate(o.iniciada_at)],
+        ["OT / ID", o.ot || o.codigo], ["Guía de remisión", NO_TRANSPORT_GUIDE_TYPES.has(o.tipo) ? "No aplica" : (o.guia_remision_transporte || "-")], ["Finalización", formatDate(o.finalizada_at)], ["Ruta", o.id_ruta || "-"], ["Placa", o.placa || "-"], ["Encomienda", o.numero_encomienda || "-"],
+        ["Responsable", o.dni_ruc_responsable || "-"], ["GPS", o.latitud ? `${o.latitud}, ${o.longitud}` : "-"],
+        ...(INVERSE_TYPES.has(o.tipo) ? [["Recepción devolución", o.estado_recepcion_devolucion === "RECEPCIONADO" ? "Recepcionado" : "Pendiente"]] : []),
+      ];
+      let html = `<div class="detail-grid">${details.map(([label, value]) => `<div class="detail-cell"><small>${escapeHtml(label)}</small><strong>${escapeHtml(value)}</strong></div>`).join("")}</div>`;
+      if (itemsResult.data.length) html += `<section class="detail-section"><h3>Sacos y bultos (${itemsResult.data.length})</h3><div class="sack-packages">${itemsResult.data.map((item) => escapeHtml(item.codigo)).join(" · ")}</div></section>`;
+      if (sacksResult.data.length) html += `<section class="detail-section"><h3>Costales y paquetes</h3>${sacksResult.data.map((sack) => { const packages = packagesResult.data.filter((item) => item.costal_id === sack.id); return `<div class="sack-card"><div class="sack-head"><strong>${escapeHtml(sack.codigo || "SIN CÓDIGO")}</strong><span class="record-tag">${packages.length} paquetes</span></div><div class="sack-packages">${packages.map((item) => escapeHtml(item.codigo)).join(" · ")}</div></div>`; }).join("")}</section>`;
+      if (emptySacksResult.data.length) {
+        const withCode = emptySacksResult.data.filter((item) => item.tipo === "CON_CODIGO");
+        const withoutCode = emptySacksResult.data.filter((item) => item.tipo === "SIN_CODIGO");
+        const totalWithCode = withCode.reduce((total, item) => total + Number(item.cantidad || 0), 0);
+        const totalWithoutCode = withoutCode.reduce((total, item) => total + Number(item.cantidad || 0), 0);
+        html += `<section class="detail-section"><h3>Sacos vacíos retornados (${totalWithCode + totalWithoutCode})</h3><p>Con código: ${totalWithCode} · Sin código: ${totalWithoutCode}</p><div class="sack-packages">${emptySacksResult.data.map((item) => item.tipo === "CON_CODIGO" ? escapeHtml(item.codigo) : `${Number(item.cantidad || 0)} sin código${item.observacion ? ` (${escapeHtml(item.observacion)})` : ""}`).join(" · ")}</div></section>`;
+      }
+      if (sealsResult.data.length) html += `<section class="detail-section"><h3>Precintos</h3><div class="sack-packages">${sealsResult.data.map((seal) => `${escapeHtml(seal.etapa)} ${seal.numero}: ${escapeHtml(seal.codigo)}`).join(" · ")}</div></section>`;
+      if (evidencesResult.data.length) html += `<section class="detail-section"><h3>Evidencias (${evidencesResult.data.length})</h3><div class="evidence-buttons">${evidencesResult.data.map((evidence) => `<button class="evidence-button" data-evidence-file="${escapeHtml(evidence.drive_file_id)}">${escapeHtml(evidence.etiqueta)}</button>`).join("")}</div><div id="evidenceViewer" class="photo-preview hidden" style="margin-top:10px"></div></section>`;
+      if (o.observaciones) html += `<section class="detail-section"><h3>Observaciones</h3><p>${escapeHtml(o.observaciones)}</p></section>`;
+      if (state.profile?.rol === "ADMINISTRADOR") {
+        html += renderAdminEditor(o, itemsResult.data, sacksResult.data, packagesResult.data, sealsResult.data, emptySacksResult.data);
+        html += auditResult.data.length
+          ? `<section class="detail-section audit-section"><div class="admin-edit-title"><div><h3>Resumen de cambios administrativos (${auditResult.data.length})</h3><small>Historial de correcciones realizadas sobre esta operación.</small></div></div><div class="audit-list">${auditResult.data.map((change) => `<div class="audit-entry"><small>${formatDate(change.created_at)} · ${escapeHtml(change.cambiado_por_nombre || change.cambiado_por_usuario || change.cambiado_por || "Administrador")}</small><strong>${escapeHtml(change.resumen)}</strong></div>`).join("")}</div></section>`
+          : `<section class="detail-section audit-section"><div class="admin-edit-title"><div><h3>Resumen de cambios administrativos</h3><small>Aún no hay correcciones registradas.</small></div></div></section>`;
+      }
+      if (["PENDIENTE", "EN_PROCESO", "BORRADOR"].includes(o.estado)) {
+        html += `<button class="button primary full" data-resume-id="${o.id}">Continuar operación</button>`;
+        if (state.profile?.rol === "ADMINISTRADOR") html += `<button class="button danger full" data-delete-operation="${o.id}">Eliminar borrador</button>`;
+      }
+      $("#recordDetail").innerHTML = html;
+      if (!$("#recordDialog").open) $("#recordDialog").showModal();
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    } finally {
+      hideLoading();
+    }
+  }
+
+  async function viewEvidence(fileId) {
+    showLoading("Cargando evidencia…");
+    try {
+      const result = await callDrive("OBTENER_EVIDENCIA", { fileId });
+      const viewer = $("#evidenceViewer");
+      viewer.innerHTML = result.mimeType === "application/pdf"
+        ? `<iframe src="${result.dataUrl}" title="Documento" style="width:100%;height:520px;border:0"></iframe>`
+        : `<img src="${result.dataUrl}" alt="Evidencia" style="width:100%;max-height:520px;object-fit:contain">`;
+      viewer.classList.remove("hidden");
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    } finally {
+      hideLoading();
+    }
+  }
+
+  async function loadUsersPanel() {
+    if (!["ADMINISTRADOR", "ENCARGADO"].includes(state.profile.rol)) return;
+    showLoading("Cargando cuentas…");
+    try {
+      const { data, error } = await db.from("perfiles").select("id,usuario,nombre,rol,pdv_id,estado,pdvs:pdv_id(codigo,nombre)").order("nombre");
+      if (error) throw error;
+      state.users = data || [];
+      $("#usersList").innerHTML = state.users.length ? state.users.map((user) => `<div class="user-card"><div class="user-data"><strong>${escapeHtml(user.nombre)}</strong><small>${escapeHtml(user.usuario)} · ${escapeHtml(user.rol)}${user.pdvs ? ` · ${escapeHtml(user.pdvs.codigo)}` : ""}</small></div><span class="status-pill ${user.estado === "ACTIVO" ? "done" : "cancelled"}">${escapeHtml(user.estado)}</span></div>`).join("") : '<div class="empty-state">No hay cuentas visibles.</div>';
+
+      if (state.profile.rol === "ADMINISTRADOR") {
+        const managers = state.users.filter((user) => user.rol === "ENCARGADO" && user.estado === "ACTIVO");
+        $("#pdvManager").innerHTML = `<option value="">Sin encargado</option>${managers.map((user) => `<option value="${user.id}">${escapeHtml(user.nombre)}</option>`).join("")}`;
+      }
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    } finally {
+      hideLoading();
+    }
+  }
+
+  async function invokeUserAdmin(body) {
+    const { data, error } = await db.functions.invoke("crear-usuario", { body });
+    if (error) throw new Error(data?.error || error.message);
+    if (data?.error) throw new Error(data.error);
+    return data;
+  }
+
+  async function createPdv(event) {
+    event.preventDefault();
+    showLoading("Creando PDV…");
+    try {
+      await invokeUserAdmin({ accion: "CREAR_PDV", codigo: normalizeCode($("#pdvCode").value), nombre: $("#pdvName").value.trim(), region: $("#pdvRegion").value.trim(), area: $("#pdvArea").value.trim(), encargado_id: $("#pdvManager").value || null });
+      $("#pdvForm").reset();
+      await loadPdvs();
+      toast("PDV creado correctamente.", "success");
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    } finally { hideLoading(); }
+  }
+
+  function normalizeHeader(value) {
+    return String(value ?? "")
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .trim()
+      .toUpperCase()
+      .replace(/[^A-Z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "");
+  }
+
+  function requireSpreadsheetLibrary() {
+    if (!window.XLSX) throw new Error("No se pudo cargar el lector de Excel. Actualice la página y vuelva a intentarlo.");
+    return window.XLSX;
+  }
+
+  function downloadPdvTemplate() {
+    try {
+      const XLSX = requireSpreadsheetLibrary();
+      const workbook = XLSX.utils.book_new();
+      const pdvSheet = XLSX.utils.json_to_sheet([], { header: BULK_PDV_HEADERS });
+      pdvSheet["!cols"] = [
+        { wch: 18 }, { wch: 30 }, { wch: 20 }, { wch: 22 }, { wch: 24 }, { wch: 20 }, { wch: 24 }, { wch: 14 },
+      ];
+      const instructions = [
+        ["CARGA MASIVA DE PDV"],
+        ["Complete la hoja PDV sin cambiar los encabezados."],
+        ["Los encargados deben existir previamente, estar activos y tener rol ENCARGADO."],
+        ["CODIGO_PDV debe ser único. Si ya existe, sus datos serán actualizados."],
+        ["USUARIO_PDV debe ser único y tener entre 3 y 30 caracteres."],
+        ["CONTRASENA_TEMPORAL debe tener entre 8 y 72 caracteres y será definida por el Administrador."],
+        ["Si la cuenta ya existe y corresponde al mismo PDV, su contraseña será actualizada."],
+        ["ESTADO solo admite ACTIVO o INACTIVO."],
+        [],
+        ["EJEMPLO"],
+        BULK_PDV_HEADERS,
+        ["PE07008", "CAL-08.pdv", "LIMA", "LIMA NORTE", "JESUS", "CAL08PDV", "Cambiar#2026", "ACTIVO"],
+      ];
+      const instructionSheet = XLSX.utils.aoa_to_sheet(instructions);
+      instructionSheet["!cols"] = [{ wch: 90 }, { wch: 30 }, { wch: 20 }, { wch: 22 }, { wch: 24 }, { wch: 20 }, { wch: 24 }, { wch: 14 }];
+      XLSX.utils.book_append_sheet(workbook, pdvSheet, "PDV");
+      XLSX.utils.book_append_sheet(workbook, instructionSheet, "INSTRUCCIONES");
+      XLSX.writeFile(workbook, "PLANTILLA_CARGA_MASIVA_PDV.xlsx");
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    }
+  }
+
+  function validateBulkPdvRows(rawRows) {
+    const managers = new Map(
+      state.users
+        .filter((user) => user.rol === "ENCARGADO" && user.estado === "ACTIVO")
+        .map((user) => [normalizeCode(user.usuario), user]),
+    );
+
+    const rows = rawRows.map((raw, index) => {
+      const keyed = {};
+      Object.entries(raw).forEach(([key, value]) => { keyed[normalizeHeader(key)] = value; });
+      return {
+        fila: index + 2,
+        codigo: normalizeCode(keyed.CODIGO_PDV),
+        nombre: String(keyed.NOMBRE_PDV ?? "").trim(),
+        region: String(keyed.REGION ?? "").trim(),
+        area: String(keyed.AREA ?? "").trim(),
+        encargado_usuario: normalizeCode(keyed.USUARIO_ENCARGADO),
+        usuario_pdv: normalizeCode(keyed.USUARIO_PDV),
+        password: String(keyed.CONTRASENA_TEMPORAL ?? ""),
+        estado: normalizeCode(keyed.ESTADO || "ACTIVO"),
+        errors: [],
+      };
+    });
+
+    const codeCounts = rows.reduce((counts, row) => {
+      if (row.codigo) counts.set(row.codigo, (counts.get(row.codigo) || 0) + 1);
+      return counts;
+    }, new Map());
+    const userCounts = rows.reduce((counts, row) => {
+      if (row.usuario_pdv) counts.set(row.usuario_pdv, (counts.get(row.usuario_pdv) || 0) + 1);
+      return counts;
+    }, new Map());
+
+    rows.forEach((row) => {
+      if (!row.codigo) row.errors.push("Falta CODIGO_PDV.");
+      else if (!/^[A-Z0-9._-]{1,50}$/.test(row.codigo)) row.errors.push("Código inválido.");
+      else if (codeCounts.get(row.codigo) > 1) row.errors.push("Código duplicado en el archivo.");
+      if (!row.nombre) row.errors.push("Falta NOMBRE_PDV.");
+      if (!row.encargado_usuario) row.errors.push("Falta USUARIO_ENCARGADO.");
+      else if (!managers.has(row.encargado_usuario)) row.errors.push("Encargado inexistente o inactivo.");
+      if (!row.usuario_pdv) row.errors.push("Falta USUARIO_PDV.");
+      else if (!/^[A-Z0-9._-]{3,30}$/.test(row.usuario_pdv)) row.errors.push("USUARIO_PDV inválido.");
+      else if (userCounts.get(row.usuario_pdv) > 1) row.errors.push("USUARIO_PDV duplicado en el archivo.");
+      if (row.password.length < 8 || row.password.length > 72) row.errors.push("La contraseña debe tener entre 8 y 72 caracteres.");
+      if (!["ACTIVO", "INACTIVO"].includes(row.estado)) row.errors.push("ESTADO debe ser ACTIVO o INACTIVO.");
+    });
+
+    return rows;
+  }
+
+  function renderBulkPdvPreview() {
+    const rows = state.bulkPdvRows;
+    const valid = rows.filter((row) => row.errors.length === 0).length;
+    const invalid = rows.length - valid;
+    $("#bulkPdvSummary").classList.remove("hidden");
+    $("#bulkPdvSummary").innerHTML = `
+      <div><span>Total</span><strong>${rows.length}</strong></div>
+      <div class="ok"><span>Válidos</span><strong>${valid}</strong></div>
+      <div class="bad"><span>Observados</span><strong>${invalid}</strong></div>`;
+    $("#bulkPdvPreview").classList.remove("hidden");
+    $("#bulkPdvPreview").innerHTML = `
+      <table class="data-table">
+        <thead><tr><th>Fila</th><th>Código</th><th>PDV</th><th>Encargado</th><th>Usuario PDV</th><th>Contraseña</th><th>Estado</th><th>Validación</th></tr></thead>
+        <tbody>${rows.slice(0, 100).map((row) => `
+          <tr class="${row.errors.length ? "row-error" : ""}">
+            <td>${row.fila}</td>
+            <td>${escapeHtml(row.codigo || "-")}</td>
+            <td>${escapeHtml(row.nombre || "-")}</td>
+            <td>${escapeHtml(row.encargado_usuario || "-")}</td>
+            <td>${escapeHtml(row.usuario_pdv || "-")}</td>
+            <td>${row.password ? "••••••••" : "-"}</td>
+            <td>${escapeHtml(row.estado || "-")}</td>
+            <td><span class="validation-pill ${row.errors.length ? "bad" : "ok"}">${escapeHtml(row.errors.length ? row.errors.join(" ") : "Válido")}</span></td>
+          </tr>`).join("")}</tbody>
+      </table>
+      ${rows.length > 100 ? `<div class="table-note">Vista previa de las primeras 100 filas de ${rows.length}.</div>` : ""}`;
+    $("#bulkPdvImportButton").disabled = valid === 0;
+  }
+
+  async function readBulkPdvFile(event) {
+    state.bulkPdvRows = [];
+    state.bulkPdvResults = [];
+    $("#bulkPdvResultButton").classList.add("hidden");
+    $("#bulkPdvMessage").className = "form-message hidden";
+    $("#bulkPdvSummary").classList.add("hidden");
+    $("#bulkPdvPreview").classList.add("hidden");
+    $("#bulkPdvImportButton").disabled = true;
+
+    const file = event.target.files?.[0];
+    if (!file) {
+      $("#bulkPdvFileInfo").textContent = "Seleccione la plantilla completada para validar los registros.";
+      return;
+    }
+
+    $("#bulkPdvFileInfo").textContent = `${file.name} · ${Math.max(1, Math.round(file.size / 1024))} KB`;
+    showLoading("Leyendo y validando archivo…");
+    try {
+      if (file.size > BULK_PDV_MAX_FILE_BYTES) throw new Error("El archivo supera el máximo permitido de 5 MB.");
+      const XLSX = requireSpreadsheetLibrary();
+      const workbook = XLSX.read(await file.arrayBuffer(), { type: "array" });
+      const sheetName = workbook.SheetNames.find((name) => normalizeHeader(name) === "PDV") || workbook.SheetNames[0];
+      if (!sheetName) throw new Error("El archivo no contiene hojas para importar.");
+      const sheet = workbook.Sheets[sheetName];
+      const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: "", raw: false, blankrows: false });
+      const detectedHeaders = new Set(Object.keys(rawRows[0] || {}).map(normalizeHeader));
+      const missing = BULK_PDV_HEADERS.filter((header) => !detectedHeaders.has(header));
+      if (missing.length) throw new Error(`Faltan columnas: ${missing.join(", ")}.`);
+      if (!rawRows.length) throw new Error("El archivo no contiene registros de PDV.");
+      if (rawRows.length > BULK_PDV_MAX_ROWS) throw new Error(`El archivo supera el máximo de ${BULK_PDV_MAX_ROWS} registros.`);
+      state.bulkPdvRows = validateBulkPdvRows(rawRows);
+      renderBulkPdvPreview();
+    } catch (error) {
+      showFormMessage("#bulkPdvMessage", errorMessage(error));
+    } finally {
+      hideLoading();
+    }
+  }
+
+  function renderBulkPdvResults(results) {
+    const created = results.filter((row) => row.resultado === "CREADO").length;
+    const updated = results.filter((row) => row.resultado === "ACTUALIZADO").length;
+    const partial = results.filter((row) => row.resultado === "PARCIAL").length;
+    const rejected = results.filter((row) => row.resultado === "RECHAZADO").length;
+    $("#bulkPdvSummary").innerHTML = `
+      <div><span>Procesados</span><strong>${results.length}</strong></div>
+      <div class="ok"><span>Creados</span><strong>${created}</strong></div>
+      <div class="updated"><span>Actualizados</span><strong>${updated}</strong></div>
+      <div class="warning"><span>Parciales</span><strong>${partial}</strong></div>
+      <div class="bad"><span>Rechazados</span><strong>${rejected}</strong></div>`;
+    $("#bulkPdvPreview").innerHTML = `
+      <table class="data-table">
+        <thead><tr><th>Fila</th><th>Código</th><th>Resultado</th><th>Detalle</th></tr></thead>
+        <tbody>${results.map((row) => `
+          <tr class="${["RECHAZADO", "PARCIAL"].includes(row.resultado) ? "row-error" : ""}">
+            <td>${row.fila}</td>
+            <td>${escapeHtml(row.codigo || "-")}</td>
+            <td><span class="validation-pill ${["RECHAZADO", "PARCIAL"].includes(row.resultado) ? "bad" : "ok"}">${escapeHtml(row.resultado)}</span></td>
+            <td>${escapeHtml(row.mensaje || "Procesado correctamente.")}</td>
+          </tr>`).join("")}</tbody>
+      </table>`;
+  }
+
+  async function importBulkPdvs() {
+    if (state.profile?.rol !== "ADMINISTRADOR") return toast("Solo el Administrador puede importar PDV.", "error");
+    const validRows = state.bulkPdvRows.filter((row) => row.errors.length === 0);
+    if (!validRows.length) return toast("No existen registros válidos para importar.", "error");
+    if (!confirm(`Se crearán o actualizarán ${validRows.length} PDV. ¿Desea continuar?`)) return;
+
+    showLoading("Importando PDV…");
+    try {
+      const results = state.bulkPdvRows
+        .filter((row) => row.errors.length)
+        .map((row) => ({ fila: row.fila, codigo: row.codigo, resultado: "RECHAZADO", mensaje: row.errors.join(" ") }));
+
+      for (let index = 0; index < validRows.length; index += BULK_PDV_BATCH_SIZE) {
+        const batch = validRows.slice(index, index + BULK_PDV_BATCH_SIZE).map((row) => ({
+          fila: row.fila,
+          codigo: row.codigo,
+          nombre: row.nombre,
+          region: row.region,
+          area: row.area,
+          encargado_usuario: row.encargado_usuario,
+          usuario_pdv: row.usuario_pdv,
+          password: row.password,
+          estado: row.estado,
+        }));
+        $("#loadingText").textContent = `Importando ${Math.min(index + batch.length, validRows.length)} de ${validRows.length}…`;
+        const response = await invokeUserAdmin({ accion: "IMPORTAR_PDVS", registros: batch });
+        results.push(...(response.resultados || []));
+      }
+
+      state.bulkPdvResults = results.sort((a, b) => a.fila - b.fila);
+      renderBulkPdvResults(state.bulkPdvResults);
+      $("#bulkPdvImportButton").disabled = true;
+      $("#bulkPdvResultButton").classList.remove("hidden");
+      const rejected = state.bulkPdvResults.filter((row) => row.resultado === "RECHAZADO").length;
+      const partial = state.bulkPdvResults.filter((row) => row.resultado === "PARCIAL").length;
+      showFormMessage("#bulkPdvMessage", rejected || partial ? `Importación terminada: ${rejected} rechazado(s) y ${partial} parcial(es). Descargue el resultado para revisar.` : "Importación completada correctamente.", rejected === 0 && partial === 0);
+      await loadPdvs();
+    } catch (error) {
+      showFormMessage("#bulkPdvMessage", errorMessage(error));
+    } finally {
+      hideLoading();
+    }
+  }
+
+  function downloadBulkPdvResult() {
+    try {
+      if (!state.bulkPdvResults.length) throw new Error("No hay resultados para descargar.");
+      const XLSX = requireSpreadsheetLibrary();
+      const sourceByRow = new Map(state.bulkPdvRows.map((row) => [row.fila, row]));
+      const rows = state.bulkPdvResults.map((row) => {
+        const source = sourceByRow.get(row.fila) || {};
+        return {
+          FILA: row.fila,
+          CODIGO_PDV: row.codigo,
+          USUARIO_PDV: source.usuario_pdv || "",
+          CONTRASENA_TEMPORAL: source.password || "",
+          RESULTADO: row.resultado,
+          DETALLE: row.mensaje || "Procesado correctamente.",
+        };
+      });
+      const workbook = XLSX.utils.book_new();
+      const sheet = XLSX.utils.json_to_sheet(rows);
+      sheet["!cols"] = [{ wch: 10 }, { wch: 20 }, { wch: 20 }, { wch: 24 }, { wch: 18 }, { wch: 55 }];
+      XLSX.utils.book_append_sheet(workbook, sheet, "RESULTADO");
+      XLSX.writeFile(workbook, `RESULTADO_CARGA_PDV_${new Date().toISOString().slice(0, 10)}.xlsx`);
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    }
+  }
+
+  async function createUser(event) {
+    event.preventDefault();
+    const role = $("#newRole").value;
+    showLoading("Creando cuenta…");
+    try {
+      await invokeUserAdmin({ accion: "CREAR_USUARIO", usuario: normalizeCode($("#newUsername").value), nombre: $("#newFullName").value.trim(), rol: role, pdv_id: role === "PDV" ? $("#newUserPdv").value : null, password: $("#newPassword").value });
+      $("#userForm").reset();
+      updateRoleFields();
+      await loadUsersPanel();
+      toast("Cuenta creada correctamente.", "success");
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    } finally { hideLoading(); }
+  }
+
+  function updateRoleFields() {
+    $("#newUserPdvField").classList.toggle("hidden", $("#newRole").value !== "PDV");
+  }
+
+  async function changePassword(event) {
+    event.preventDefault();
+    const password = $("#passwordNew").value;
+    const confirmPassword = $("#passwordConfirm").value;
+    if (password.length < 8) return toast("La contraseña debe tener al menos 8 caracteres.", "error");
+    if (password !== confirmPassword) return toast("Las contraseñas no coinciden.", "error");
+    showLoading("Actualizando contraseña…");
+    try {
+      const { error } = await db.auth.updateUser({ password });
+      if (error) throw error;
+      $("#passwordForm").reset();
+      $("#passwordDialog").close();
+      toast("Contraseña actualizada.", "success");
+    } catch (error) {
+      toast(errorMessage(error), "error");
+    } finally { hideLoading(); }
+  }
+
+  function closeAllDialogs() {
+    $$("dialog[open]").forEach((dialog) => dialog.close());
+  }
+
+  function registerEvents() {
+    $("#loginForm").addEventListener("submit", login);
+    $("#operationSetup").addEventListener("submit", startOperation);
+    $("#devolucionForm").addEventListener("submit", saveDevolucion);
+    $("#pdvForm").addEventListener("submit", createPdv);
+    $("#userForm").addEventListener("submit", createUser);
+    $("#passwordForm").addEventListener("submit", changePassword);
+    $("#newRole").addEventListener("change", updateRoleFields);
+    $("#bulkPdvFile").addEventListener("change", readBulkPdvFile);
+    $("#transportGuideInput").addEventListener("change", (event) => handleTransportGuide(event.target));
+    $("#transportGuideNumber").addEventListener("change", async () => {
+      if (!state.operation) return;
+      showLoading("Guardando guía…");
+      try {
+        await syncOperationMetadata();
+        markOperationInProcess();
+      } catch (error) {
+        toast(errorMessage(error), "error");
+      } finally {
+        hideLoading();
+      }
+    });
+    $("#inversePhotoInput").addEventListener("change", (event) => handleGeneralPhotos(event.target, "inverse"));
+    $("#parcelPhotoInput").addEventListener("change", (event) => handleGeneralPhotos(event.target, "parcel"));
+    $("#emptySackPhotoInput").addEventListener("change", (event) => handleGeneralPhotos(event.target, "empty"));
+    $("#devolucionPhotoInput").addEventListener("change", (event) => handleDevolucionPhoto(event.target));
+
+    document.addEventListener("change", (event) => {
+      if (event.target.matches(".photo-slot input[type=file], .seal-photo")) handlePhotoSlot(event.target);
+    });
+
+    document.addEventListener("click", async (event) => {
+      const viewButton = event.target.closest("[data-view]");
+      if (viewButton) { switchView(viewButton.dataset.view); return; }
+      const operationButton = event.target.closest("[data-operation]");
+      if (operationButton) { selectOperation(operationButton.dataset.operation); return; }
+      const actionButton = event.target.closest("[data-action]");
+      if (actionButton) {
+        const action = actionButton.dataset.action;
+        if (action === "toggle-password") {
+          const input = document.getElementById(actionButton.dataset.target);
+          input.type = input.type === "password" ? "text" : "password";
+          actionButton.textContent = input.type === "password" ? "Ver" : "Ocultar";
+        } else if (action === "open-account-menu") $("#accountDialog").showModal();
+        else if (action === "open-password-dialog") { $("#accountDialog").close(); $("#passwordDialog").showModal(); }
+        else if (action === "close-dialog") document.getElementById(actionButton.dataset.dialog)?.close();
+        else if (action === "logout") await logout();
+        else if (action === "cancel-operation") cancelOperationSelection();
+        else if (action === "new-devolucion") { resetDevolucionState(); switchView("returns"); $("#devolucionOt").focus(); }
+        else if (action === "load-devolucion-ot") await loadDevolucionOt();
+        else if (action === "add-receipt-manual") { if (await addReceiptCode($("#manualReceiptCode").value)) $("#manualReceiptCode").value = ""; }
+        else if (action === "add-sack-manual") { if (await openSack($("#manualSackCode").value)) $("#manualSackCode").value = ""; }
+        else if (action === "add-package-manual") { if (await addPackage($("#manualPackageCode").value)) $("#manualPackageCode").value = ""; }
+        else if (action === "add-empty-sack-manual") { if (await addEmptySackCode($("#manualEmptySackCode").value)) $("#manualEmptySackCode").value = ""; }
+        else if (action === "add-empty-sack-no-code") await addEmptySackWithoutCode();
+        else if (action === "close-sack") await closeSack();
+        else if (action === "get-gps") await getGps();
+        else if (action === "finish-operation") await finishOperation();
+        else if (action === "delete-active-operation") await deleteOperation(state.operation?.id);
+        else if (action === "add-admin-sack") addAdminSackRow();
+        else if (action === "save-admin-record") await saveAdminRecord(actionButton.dataset.adminOperationId);
+        else if (action === "remove-transport-guide") await removeTransportGuide();
+        else if (["refresh-records", "search-records"].includes(action)) await loadRecords();
+        else if (action === "refresh-devoluciones") await loadDevoluciones();
+        else if (action === "refresh-users") await loadUsersPanel();
+        else if (action === "download-pdv-template") downloadPdvTemplate();
+        else if (action === "import-pdvs") await importBulkPdvs();
+        else if (action === "download-pdv-result") downloadBulkPdvResult();
+        else if (action === "scanner-close") stopScanner();
+        else if (action === "scanner-camera") await changeCamera();
+        return;
+      }
+
+      const itemTypeButton = event.target.closest("[data-item-type]");
+      if (itemTypeButton) { setItemType(itemTypeButton.dataset.itemType); return; }
+      const scanModeButton = event.target.closest("[data-scan-mode]");
+      if (scanModeButton) {
+        const labels = { SACK: "costal", PACKAGE: "paquete", EMPTY_SACK: "saco vacío con código", RECEIPT_ITEM: "saco o bulto" };
+        await startScanner(scanModeButton.dataset.scanMode, "", labels[scanModeButton.dataset.scanMode] || "código");
+        return;
+      }
+      const scanTargetButton = event.target.closest("[data-scan-target]");
+      if (scanTargetButton) { await startScanner("INPUT", scanTargetButton.dataset.scanTarget, scanTargetButton.dataset.scanLabel); return; }
+      const scanSealButton = event.target.closest("[data-scan-seal]");
+      if (scanSealButton) {
+        const card = scanSealButton.closest(".seal-card");
+        const id = `seal-${scanSealButton.dataset.scanSeal.replace(":", "-")}`;
+        card.querySelector(".seal-code").id = id;
+        await startScanner("INPUT", id, scanSealButton.dataset.scanLabel);
+        return;
+      }
+      const deleteItemButton = event.target.closest("[data-delete-item]");
+      if (deleteItemButton) { await deleteReceiptItem(deleteItemButton.dataset.deleteItem); return; }
+      const deleteSackButton = event.target.closest("[data-delete-sack]");
+      if (deleteSackButton) { await deleteSack(deleteSackButton.dataset.deleteSack); return; }
+      const deletePackageButton = event.target.closest("[data-delete-package]");
+      if (deletePackageButton) { await deletePackage(deletePackageButton.dataset.deletePackage); return; }
+      const deleteEmptySackButton = event.target.closest("[data-delete-empty-sack]");
+      if (deleteEmptySackButton) { await deleteEmptySack(deleteEmptySackButton.dataset.deleteEmptySack); return; }
+      const emptySackTypeButton = event.target.closest("[data-empty-sack-type]");
+      if (emptySackTypeButton) { setEmptySackType(emptySackTypeButton.dataset.emptySackType); return; }
+      const removePhotoButton = event.target.closest("[data-remove-photo]");
+      if (removePhotoButton) { const [kind, index] = removePhotoButton.dataset.removePhoto.split(":"); removeGeneralPhoto(kind, Number(index)); return; }
+      const record = event.target.closest("[data-record-id]");
+      if (record) { await openRecord(record.dataset.recordId); return; }
+      const devolucion = event.target.closest("[data-devolucion-ot]");
+      if (devolucion) { $("#devolucionOt").value = devolucion.dataset.devolucionOt; await loadDevolucionOt(); return; }
+      const resume = event.target.closest("[data-resume-id]");
+      if (resume) { await resumeOperation(resume.dataset.resumeId); return; }
+      const deleteOperationButton = event.target.closest("[data-delete-operation]");
+      if (deleteOperationButton) { await deleteOperation(deleteOperationButton.dataset.deleteOperation); return; }
+      const evidence = event.target.closest("[data-evidence-file]");
+      if (evidence) await viewEvidence(evidence.dataset.evidenceFile);
+    });
+
+    for (const id of ["manualReceiptCode", "manualSackCode", "manualPackageCode", "manualEmptySackCode"]) {
+      document.getElementById(id).addEventListener("keydown", (event) => {
+        if (event.key !== "Enter") return;
+        event.preventDefault();
+        const action = id === "manualReceiptCode" ? "add-receipt-manual" : id === "manualSackCode" ? "add-sack-manual" : id === "manualPackageCode" ? "add-package-manual" : "add-empty-sack-manual";
+        document.querySelector(`[data-action="${action}"]`).click();
+      });
+    }
+    $("#devolucionOt").addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      $("[data-action=load-devolucion-ot]").click();
+    });
+    window.addEventListener("beforeunload", () => stopScanner(false));
+  }
+
+  async function boot() {
+    registerEvents();
+    updateRoleFields();
+    $("#filterFrom").value = todayInput();
+    $("#filterTo").value = todayInput();
+    showLoading("Inicializando…");
+    try {
+      const { data, error } = await db.auth.getSession();
+      if (error) throw error;
+      if (data.session) await initializeSession(data.session);
+      else showLogin();
+    } catch (error) {
+      console.error(error);
+      showLogin();
+      toast(errorMessage(error), "error");
+    } finally {
+      hideLoading();
+    }
+  }
+
+  boot();
+})();
