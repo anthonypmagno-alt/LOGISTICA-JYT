@@ -1,11 +1,6 @@
-window.APP_CONFIG = Object.freeze({
-  SUPABASE_URL: "https://qtgcpmpbtfhvoasncmkg.supabase.co",
-  SUPABASE_PUBLISHABLE_KEY: "sb_publishable_tj-kyp78upcwyrLbhMTqaA_l3lfRpt8",
-  DRIVE_API_URL: "https://script.google.com/macros/s/AKfycbxe4pJaQyyIT7lYFlTGulWwAsZ3mlH-owAzs5kZe3uLtEi_aS5HWeUArHbKizzTslQX/exec",
-  INTERNAL_EMAIL_DOMAIN: "control-logistico.local",
-  TIME_ZONE: "America/Lima",
-  MAX_GENERAL_PHOTOS: 3,
-  PHOTO_MAX_SIDE: 1600,
-  PHOTO_QUALITY: 0.78,
-});
-
+// Clave pública: nunca colocar service_role ni contraseñas aquí.
+window.V16_CONFIG={
+ url:'https://akultekodxqmmfchxviq.supabase.co',
+ key:'sb_publishable_q2JKc7YQg9-8M7TARE3jSA_FdRUz8jy',
+ loginDomain:'revision.local'
+};
