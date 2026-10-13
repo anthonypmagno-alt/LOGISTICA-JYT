@@ -5,7 +5,7 @@ Este paquete integra Penalidades dentro del portal principal. El index.html cons
 PUBLICAR EN GITHUB PAGES
 1. Descomprime el ZIP.
 2. En el repositorio que publicarás con GitHub Pages, carga el CONTENIDO de esta carpeta en la raíz (donde quedará index.html). No subas la carpeta contenedora como un nivel adicional.
-3. Conserva juntos index.html, config.js, bridge.js, gestion-v2.html, pdv.html, pdv-v2.html, penalidades.html, process-worker.js, pdf-pdv.js y brecha-costos.js.
+3. Conserva juntos index.html, config.js, bridge.js, gestion-v2.html, xlsx-resumen.js, pdv.html, pdv-v2.html, penalidades.html, process-worker.js, pdf-pdv.js y brecha-costos.js.
 4. Espera a que GitHub Pages termine de publicar y abre la raíz del portal, por ejemplo https://TU-USUARIO.github.io/TU-REPOSITORIO/. Inicia sesión ahí y entra a la pestaña Penalidades. No abras un index.html independiente de Penalidades.
 
 ACTUALIZACION DE PENALIDADES (09-10-2026)
@@ -53,5 +53,66 @@ ACTUALIZACION MONTO INICIAL DE PENALIDAD (11-10-2026)
 ACTUALIZACION GESTION DE GUIAS V2 (12-10-2026)
 - El resumen incluye el botón “Solo casos críticos”. Al activarlo, conserva los filtros elegidos y muestra únicamente los PDV cuyo “Total crítico” es mayor que cero; recalcula subtotales y total general para los PDV visibles.
 - “Excel resumen” exporta la tabla V2 que se ve en pantalla, con encabezados agrupados, filas por región y área, subtotales, total general y colores. La descarga respeta los filtros aplicados y los grupos que estén desplegados o contraídos.
-- El resumen se descarga como archivo Excel compatible (.xls) para conservar los estilos; se abre con Excel y no requiere ejecutar SQL.
-- El enlace de Gestión de guías V2 incluye el identificador 20261012-resumen-v2-1 para evitar que el navegador conserve la versión anterior.
+- El resumen se descarga como un archivo .xlsx real, conservando combinaciones de encabezados, grupos, subtotales, colores y estilos.
+- El Excel agrega una columna COMENTARIO a la derecha del cuadro resumen original (después de 💬), con el texto guardado para cada PDV.
+- El generador XLSX está incluido localmente como xlsx-resumen.js, así que la descarga no depende de un CDN ni requiere ejecutar SQL.
+- El enlace de Gestión de guías V2 incluye el identificador 20261012-resumen-comentarios-xlsx-5 para evitar que el navegador conserve la versión anterior.
+
+
+RETENCION PARA MEJORA (13-10-2026)
+- El porcentaje se aplica al saldo de la penalidad después de descontar la exoneración. El monto retenido se muestra en el detalle, los indicadores y la tabla de liquidaciones.
+- La retención es condicional y no se resta de la Liq. final.
+- El Excel de detalle conserva sus columnas existentes y termina con RETENCIÓN PARA MEJORA (%) y RETENCIÓN PARA MEJORA (S/).
+- Para conservar la retención entre sesiones y compartirla entre usuarios, ejecuta una sola vez SUPABASE_SQL/supabase_penalidades_retencion_mejora.sql en el mismo proyecto Supabase. El cambio agrega una columna a las decisiones existentes y actualiza tres funciones; no elimina registros.
+- Publica el contenido completo del ZIP en la raíz del repositorio. El enlace de Penalidades del index usa la versión 20261013-resumen-penalidad-1.
+
+
+RESUMEN CONTRAIBLE POR PENALIDAD (13-10-2026)
+- Cada penalidad muestra una fila agregada. “Expandir todo” abre los motivos y los subtipos; “Contraer por penalidad” vuelve a una fila por penalidad. Los motivos conservan su propio control para abrir o cerrar los subtipos de Brecha o SLA.
+- El enlace de Penalidades se actualiza con la versión 20261013-resumen-penalidad-1.
+- No requiere ejecutar SQL adicional.
+
+
+AJUSTE DE RETENCION Y ANCHO DE TABLAS (13-10-2026)
+- El resumen por penalización y motivo de decisión agrega la columna “Retención para mejora (S/)” después del saldo; los importes se totalizan en cada grupo y en el total general.
+- Se amplía la columna de retención para mejora en las liquidaciones guardadas y en el detalle para facilitar la lectura.
+- El detalle completo reduce el ancho de sus columnas para mostrar más información a la vez; conserva desplazamiento horizontal cuando la pantalla no alcanza y mantiene fijas las columnas de selección, fecha, PDV y guía.
+- El enlace de Penalidades del index.html usa la versión 20261013-retencion-ancho-tablas-2 para actualizar la caché.
+- Es un ajuste visual y no requiere ejecutar SQL adicional.
+
+
+CORRECCION DE DESTINO Y ULTIMO ESCANEO (13-10-2026)
+- Mapeo geográfico de Exportación de guía: Distrito = Colonia de destino; Provincia = Ciudad de Destino; Departamento = Provincia de destino.
+- Mapeo por columna de Exportación de guía: H = fecha/hora del último escaneo; I = tipo de escaneo más reciente; L = estatus de firma. El importador también reconoce los encabezados si cambian.
+- Detalle completo muestra destino, tipo de escaneo combinado con estatus de firma y fecha/hora del último escaneo. Supabase conserva estos datos junto con las liquidaciones.
+- Ejecuta una vez SUPABASE_SQL/supabase_penalidades_fecha_escaneo.sql. El cambio es incremental y no elimina liquidaciones ni decisiones.
+- Después, vuelve a cargar Exportación de guía en Penalidades. La importación actualiza las liquidaciones existentes y sincroniza los campos recuperados; no borres ni recrees registros. Los valores históricos que no se guardaron se completan al volver a importar la exportación.
+- Al cargar el archivo, el aviso informa cuántas filas incluyen destino, escaneo, firma y fecha completos, además de cuántas penalidades se enlazaron.
+- El enlace de Penalidades del index.html usa la versión 20261013-destino-escaneo-3 para actualizar la caché.
+
+RETENCION CALCULADA SOBRE EL SALDO (13-10-2026)
+- El porcentaje de retención se calcula sobre el saldo de la penalidad después de aplicar la exoneración.
+- El monto retenido sigue siendo condicional y no se descuenta de la Liquidación final.
+- La base aparece aclarada en el detalle; los resúmenes, el Excel y Supabase usan el mismo cálculo.
+- Exoneración y saldo se redondean por guía a dos decimales; el saldo es el remanente para que exoneración + saldo coincidan con la penalidad original.
+- Ejecuta una vez SUPABASE_SQL/supabase_penalidades_retencion_sobre_saldo.sql para actualizar el resumen que Supabase devuelve al abrir el portal. No modifica ni elimina registros.
+- El enlace de Penalidades del index.html usa la versión 20261013-retencion-sobre-saldo-1 para actualizar la caché.
+
+OPTIMIZACION DE SINCRONIZACION (13-10-2026)
+- El guardado ya no copia las filas completas de los Excel fuente en cada sincronización; solo procesa registros, liquidaciones, grupos y guías.
+- Los detalles se cargan en páginas de hasta 1,000 guías y los lotes de guardado de guías también admiten hasta 1,000 filas. Se procesan hasta dos liquidaciones independientes en paralelo; los lotes de una misma liquidación conservan su orden.
+- Los cambios de exoneración, retención y motivo se envían a una función que actualiza solo la tabla de decisiones; no vuelve a escribir las otras columnas de esas guías. Los cambios de datos fuente sí actualizan los campos de la guía.
+- Los grupos solo se envían cuando cambian, y la activación de Penalidades se ejecuta una sola vez por sesión.
+- El indicador superior informa el avance de guías sincronizadas.
+- Las decisiones de exoneración, retención y motivo se envían directamente por sus IDs modificados. Este guardado no copia ni compara todas las guías cargadas en la pestaña. Los cambios de archivos fuente, grupos y liquidaciones siguen el guardado general.
+- Las solicitudes a Supabase tienen un límite de 60 segundos; si alguna queda bloqueada, la pantalla informa la fase y el error en vez de permanecer en “Sincronizando” indefinidamente.
+- El CSV de lints enviado el 13-10-2026 confirma que `public.penalidades_actualizar_decisiones(p_decisiones jsonb)` ya existe en Supabase; no vuelvas a ejecutar ese SQL.
+- El enlace de Penalidades del index.html usa la versión 20261013-sync-directo-3 para actualizar la caché.
+
+AJUSTE DE PENALIDAD TOTAL Y COPIA DE MOTIVO (13-10-2026)
+- En “Registros guardados” se agregó “Ajuste penalidad total”. Si el campo queda vacío, el cálculo usa la penalidad total original. Si se ingresa un monto, ese valor sustituye el total para calcular el saldo de penalidad: saldo = ajuste − monto exonerado. El ajuste no puede ser menor al monto ya exonerado.
+- “Liq. final” conserva la fórmula existente: monto de liquidación − saldo de penalidad. Ejemplo: penalidad original S/ 2,500, ajuste S/ 2,300 y monto exonerado S/ 500 producen saldo S/ 1,800; Liq. final será el monto de liquidación menos S/ 1,800.
+- El ajuste se guarda por periodo y PDV en Supabase. El detalle de cada guía conserva los importes originales del Excel; el ajuste no se distribuye entre guías. El total general del resumen de penalización sí usa la base ajustada.
+- En la columna “Motivo de decisión” del detalle se agregó un botón “Copiar motivo” por guía. Copia el texto visible en el campo, aunque todavía no se haya guardado.
+- En Supabase, ejecuta una sola vez `SUPABASE_SQL/supabase_penalidades_ajuste_penalidad_total.sql`. El script agrega una columna nullable y una función RPC; actualiza la función de resumen para devolver el ajuste. No borra ni reinicia datos.
+- Publica el contenido completo del ZIP en la raíz del repositorio. El enlace de Penalidades del index.html usa la versión `20261013-ajuste-penalidad-copiar-motivo-1`.
